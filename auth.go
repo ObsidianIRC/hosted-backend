@@ -23,6 +23,12 @@ type JWTClaims struct {
 // AuthMiddleware verifies JWT token and checks for IRCop status
 func AuthMiddleware(next http.HandlerFunc, requireIRCOp bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Allow OPTIONS requests for CORS preflight without authentication
+		if r.Method == http.MethodOptions {
+			next(w, r)
+			return
+		}
+
 		authHeader := r.Header.Get("Authorization")
 		if authHeader == "" {
 			http.Error(w, "Authorization header required", http.StatusUnauthorized)
