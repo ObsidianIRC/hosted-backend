@@ -268,7 +268,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request, port string, deleteTi
 		})
 
 		// Return the saved URL
-		savedURL := fmt.Sprintf("http://localhost:%s/images/%s", port, filename)
+		savedURL := fmt.Sprintf("/images/%s", filename)
 		response := UploadResponse{SavedURL: savedURL}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(response)
@@ -312,7 +312,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request, port string, deleteTi
 		})
 
 		// Return the saved URL
-		savedURL := fmt.Sprintf("http://localhost:%s/images/%s", port, filename)
+		savedURL := fmt.Sprintf("/images/%s", filename)
 		response := UploadResponse{SavedURL: savedURL}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(response)
@@ -376,7 +376,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request, port string, deleteTi
 		})
 
 		// Return the saved URL
-		savedURL := fmt.Sprintf("http://localhost:%s/images/%s", port, filename)
+		savedURL := fmt.Sprintf("/images/%s", filename)
 		response := UploadResponse{SavedURL: savedURL}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(response)
