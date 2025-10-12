@@ -16,6 +16,7 @@ import (
 
 	"github.com/disintegration/imaging"
 	"github.com/gorilla/mux"
+	"github.com/joho/godotenv"
 )
 
 type UploadRequest struct {
@@ -99,6 +100,11 @@ func createEXIF(author string, expiry time.Time) []byte {
 }
 
 func main() {
+	// Load environment variables from .env file
+	if err := godotenv.Load(); err != nil {
+		fmt.Printf("Warning: Error loading .env file: %v\n", err)
+	}
+
 	// Create images directory if it doesn't exist
 	os.MkdirAll("images", os.ModePerm)
 
