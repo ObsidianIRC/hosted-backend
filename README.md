@@ -1,16 +1,17 @@
-# Image Upload Backend
+# IRC Backend API Server
 
-A lightweight, high-performance Go backend server that provides a flexible REST API for temporary image hosting. Upload images via URL, form data, or raw binary—get instant access with automatic cleanup.
+A comprehensive Go backend server providing REST APIs for IRC server management, account/channel administration, temporary image hosting, and JWT-authenticated IRC data access. Built with SQLite, Gorilla Mux, and WebSocket RPC connectivity.
 
 ## Features
 
-- **Multiple Upload Methods**: JSON URL upload, multipart form upload, and raw binary upload
-- **Automatic Expiration**: Images self-destruct after 2 minutes for enhanced privacy
-- **Zero Dependencies**: Pure Go implementation with standard library only
-- **RESTful API**: Clean, intuitive endpoints for uploads and image access
-- **Type Preservation**: Maintains original file extensions (jpg, png, etc.)
-- **Thread-Safe**: Concurrent upload handling with unique timestamp-based naming
-- **CORS Enabled**: Supports cross-origin requests from web applications
+- **IRC Server Integration**: WebSocket RPC connection to UnrealIRCd for real-time data
+- **Account Management**: User registration, login verification, metadata, and email verification
+- **Channel Management**: Channel creation, updates, permissions, and metadata
+- **JWT Authentication**: IRCv3 extjwt support for secure client access
+- **Image Upload Service**: Temporary image hosting with automatic cleanup
+- **SQLite Database**: Full schema for users, channels, metadata, and permissions
+- **Multiple Auth Methods**: JWT tokens, server API keys, and public endpoints
+- **RESTful API**: Clean, well-documented endpoints for all operations
 
 ## Quick Start
 
@@ -24,21 +25,73 @@ A lightweight, high-performance Go backend server that provides a flexible REST 
 # Clone or navigate to the project directory
 cd backend
 
+# Set required environment variables
+export JWT_SECRET=testsecret
+export IRC_SERVER_KEY=testkey
+
 # Run directly
-go run main.go
+go run .
 
 # Or build and run
-go build .
+CGO_ENABLED=1 go build .
 ./backend
 ```
 
 The server starts on **`http://localhost:8080`**
 
+**Note:** For full functionality, also set up the IRC server connection variables if using IRC features.
+
+### Database
+
+The server automatically creates an SQLite database (`irc_backend.db`) on first run with the following schema:
+
+- **users**: Account information with Argon2id hashed passwords
+- **user_metadata**: Key-value metadata for users
+- **channels**: Channel information
+- **channel_metadata**: Key-value metadata for channels  
+- **channel_permissions**: User permissions for channels
+- **email_verifications**: Email verification codes
+
+An admin user is created automatically for testing.
+
 ## API Reference
+
+### Authentication
+
+This backend uses multiple authentication methods:
+
+- **JWT Tokens**: For IRC clients accessing privileged data
+- **Server API Key**: For IRC server managing accounts/channels (`X-ObsidianIRC-Key` header)
+- **Public**: Image serving and some informational endpoints
+
+### Endpoints Overview
+
+| Endpoint | Method | Auth Required | Description |
+|----------|--------|---------------|-------------|
+| `/upload` | POST | JWT | Upload images |
+| `/images/{filename}` | GET | None | Serve uploaded images |
+| `/irc/users` | GET | JWT + IRCop | Get IRC users |
+| `/irc/channels` | GET | JWT + IRCop | Get IRC channels |
+| `/irc/bans` | GET | JWT + IRCop | Get server bans |
+| `/irc/stats` | GET | JWT + IRCop | Get server stats |
+| `/irc/server-uptime` | GET | JWT + IRCop | Get server uptime |
+| `/irc/accounts/register` | POST | Server Key | Register account |
+| `/irc/accounts/login` | POST | Server Key | Login (verify password) |
+| `/irc/accounts/{id}` | GET | Server Key | Get account |
+| `/irc/accounts/{id}` | PUT | Server Key | Update account |
+| `/irc/accounts/{id}/metadata` | POST | Server Key | Set user metadata |
+| `/irc/accounts/verify/{code}` | GET | Server Key | Verify email |
+| `/irc/channels/register` | POST | Server Key | Register channel |
+| `/irc/channels/{id}` | GET | Server Key | Get channel |
+| `/irc/channels/{id}` | PUT | Server Key | Update channel |
+| `/irc/channels/{id}/metadata` | POST | Server Key | Set channel metadata |
+| `/irc/channels/{id}/permissions` | POST | Server Key | Set channel permissions |
 
 ### Upload Image
 
 **Endpoint:** `POST /upload`
+
+**Authentication:** JWT token required
 
 Upload an image using one of three methods. All methods return the same response format.
 
@@ -140,22 +193,404 @@ All uploaded images are **automatically deleted 2 minutes** after upload. This e
 - Disk space management
 - No manual cleanup required
 
+**Status:** `404 Not Found`
+```
+Image expired or doesn't exist
+```
+
+## JWT Authentication for IRC Clients
+
+This backend supports JWT-based authentication using the IRCv3 `extjwt` extension, allowing IRC clients to securely access privileged endpoints (e.g., IRC server information) without exposing credentials.
+
+### Prerequisites
+
+- UnrealIRCd server with `extjwt` module enabled
+- IRC client that supports `EXTJWT` command
+- `JWT_SECRET` environment variable set on the backend
+
+### How It Works
+
+1. **IRC Server Generates Token**: When you send `EXTJWT *` in IRC, the server creates a signed JWT containing your user info (nick, account, modes).
+2. **Client Receives Token**: The JWT is sent back via IRC protocol.
+3. **Client Uses Token**: Include the JWT in API requests to access protected endpoints.
+
+**Note:** The `/irc/accounts/login` endpoint is for IRC servers to verify passwords during login, not for clients to obtain JWTs. JWTs are provided by the IRC server via the `EXTJWT` command.
+
+### IRC Client Implementation
+
+#### Step 1: Request JWT Token
+
+Send the `EXTJWT` command to your IRC server:
+
+```
+/EXTJWT *
+```
+
+The server responds with something like:
+```
+EXTJWT * * eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+```
+
+#### Step 2: Extract the Token
+
+Parse the IRC message to extract the JWT token (the long base64 string).
+
+#### Step 3: Use Token in API Requests
+
+Include the token in the `Authorization` header for protected endpoints:
+
+```bash
+curl -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." \
+  http://localhost:8080/irc/users
+```
+
+### Protected Endpoints
+
+All `/irc/*` endpoints require:
+- Valid JWT token
+- User must be an IRC operator (`umodes` includes `"o"`)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/irc/users` | GET | List all IRC users |
+| `/irc/channels` | GET | List all channels |
+| `/irc/bans` | GET | List server bans |
+| `/irc/stats` | GET | Server statistics |
+| `/irc/server-uptime?server=name` | GET | Server uptime info |
+
+#### Example: Get IRC Users
+
+```bash
+# First get JWT token via IRC
+/EXTJWT *
+
+# Then use it in API
+curl -H "Authorization: Bearer YOUR_JWT_TOKEN" \
+  http://localhost:8080/irc/users
+```
+
+**Response:**
+```json
+[
+  {
+    "name": "user1",
+    "hostname": "example.com",
+    "ip": "192.168.1.1",
+    "connected_since": 1638360000,
+    "modes": ["o"]
+  }
+]
+```
+
+### JavaScript IRC Client Example
+
+```javascript
+// Assuming you have an IRC client library
+const ircClient = new IRCClient('irc.example.com', 'mynick');
+
+// Connect and request JWT
+ircClient.connect().then(() => {
+  ircClient.send('EXTJWT *');
+});
+
+// Listen for EXTJWT response
+ircClient.on('message', (message) => {
+  if (message.command === 'EXTJWT') {
+    const jwtToken = message.params[2]; // Extract token
+    
+    // Use token for API calls
+    fetch('http://localhost:8080/irc/users', {
+      headers: {
+        'Authorization': `Bearer ${jwtToken}`
+      }
+    })
+    .then(res => res.json())
+    .then(users => console.log('IRC Users:', users));
+  }
+});
+```
+
+### Python IRC Client Example
+
+```python
+import irc.client
+import requests
+
+class JWTIRCClient(irc.client.SimpleIRCClient):
+    def __init__(self, server, nick):
+        super().__init__()
+        self.server = server
+        self.nick = nick
+        self.jwt_token = None
+
+    def on_welcome(self, connection, event):
+        # Request JWT token
+        connection.send_raw('EXTJWT *')
+
+    def on_extjwt(self, connection, event):
+        # Parse EXTJWT response
+        self.jwt_token = event.arguments[2]
+        print(f"Received JWT: {self.jwt_token}")
+        
+        # Use token for API
+        headers = {'Authorization': f'Bearer {self.jwt_token}'}
+        response = requests.get('http://localhost:8080/irc/users', headers=headers)
+        users = response.json()
+        print('IRC Users:', users)
+
+# Usage
+client = JWTIRCClient('irc.example.com', 'mynick')
+client.connect('irc.example.com', 6667, 'mynick')
+client.start()
+```
+
+### Token Expiration
+
+- Tokens expire in **30 seconds** (IRC server setting)
+- Clients must request fresh tokens via `EXTJWT *` before each API call
+- Expired tokens return `401 Unauthorized`
+
+### Error Responses
+
+**Invalid/Missing Token:**
+```
+HTTP 401 Unauthorized
+Authorization header required
+```
+
+**Not an IRC Operator:**
+```
+HTTP 403 Forbidden
+IRCop status required
+```
+
+**Token Expired:**
+```
+HTTP 401 Unauthorized
+Invalid token
+```
+
+## IRC Server Management Endpoints
+
+These endpoints are intended **only for the IRC server** to manage accounts and channels. They require the `X-ObsidianIRC-Key` header with the server API key.
+
+### Prerequisites
+
+- `IRC_SERVER_KEY` environment variable set
+- Requests must include: `X-ObsidianIRC-Key: <server_key>`
+
+### Account Management
+
+#### Register Account
+
+**Endpoint:** `POST /irc/accounts/register`
+
+**Request:**
+```json
+{
+  "account_name": "johndoe",
+  "email_address": "john@example.com",
+  "password_b64": "cGFzc3dvcmQ="  // base64 encoded password
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "code": "ACCOUNT_CREATED",
+  "message": "Account created successfully",
+  "data": {
+    "user_id": 1,
+    "verification_code": "abc123..."
+  }
+}
+```
+
+#### Login
+
+**Endpoint:** `POST /irc/accounts/login`
+
+**Authentication:** Server API key required
+
+Used by IRC servers to verify user passwords during login. Returns user information on successful authentication.
+
+**Request:**
+```json
+{
+  "account_name": "johndoe",
+  "password_b64": "cGFzc3dvcmQ="
+}
+```
+
+**Response:**
+```json
+{
+  "success": true,
+  "code": "LOGIN_SUCCESS",
+  "message": "Login successful",
+  "data": {
+    "id": 1,
+    "account_name": "johndoe",
+    "email_address": "john@example.com",
+    "date_registered": "2025-10-12T10:00:00Z",
+    "last_logged_in": "2025-10-12T12:00:00Z"
+  }
+}
+```
+
+#### Update Account
+
+**Endpoint:** `PUT /irc/accounts/{id}`
+
+**Request:**
+```json
+{
+  "email_address": "newemail@example.com",
+  "password_b64": "bmV3cGFzcw=="
+}
+```
+
+#### Get Account
+
+**Endpoint:** `GET /irc/accounts/{id}`
+
+#### Set User Metadata
+
+**Endpoint:** `POST /irc/accounts/{id}/metadata`
+
+**Request:**
+```json
+{
+  "key": "avatar",
+  "value": "https://example.com/avatar.jpg"
+}
+```
+
+#### Verify Email
+
+**Endpoint:** `GET /irc/accounts/verify/{code}`
+
+### Channel Management
+
+#### Register Channel
+
+**Endpoint:** `POST /irc/channels/register`
+
+**Request:**
+```json
+{
+  "channel_name": "#mychannel",
+  "channel_topic": "Welcome to my channel",
+  "modes": "+nt"
+}
+```
+
+#### Update Channel
+
+**Endpoint:** `PUT /irc/channels/{id}`
+
+**Request:**
+```json
+{
+  "channel_topic": "Updated topic",
+  "modes": "+nt"
+}
+```
+
+#### Get Channel
+
+**Endpoint:** `GET /irc/channels/{id}`
+
+#### Set Channel Metadata
+
+**Endpoint:** `POST /irc/channels/{id}/metadata`
+
+**Request:**
+```json
+{
+  "key": "description",
+  "value": "A cool channel"
+}
+```
+
+#### Set Channel Permissions
+
+**Endpoint:** `POST /irc/channels/{id}/permissions`
+
+**Request:**
+```json
+{
+  "user_id": 1,
+  "permissions": "o"  // IRC mode: o=op, ao=auto-op, qo=quiet-op, v=voice
+}
+```
+
+### Database Schema
+
+The backend uses SQLite with the following tables:
+
+- **users**: id, account_name, email_address, date_registered, last_logged_in, password_hash
+- **user_metadata**: id, user_id, key, value
+- **channels**: id, channel_name, channel_topic, modes
+- **channel_metadata**: id, channel_id, key, value
+- **channel_permissions**: id, user_id, channel_id, permissions
+- **email_verifications**: id, user_id, code, expires_at, verified
+
+### Security Notes
+
+- Passwords are hashed with Argon2id
+- All endpoints require the server API key
+- Email verification codes expire in 24 hours
+- Permissions use IRC mode syntax (o, ao, qo, v)
+
+### Security Notes
+
+- **JWT Authentication**: Tokens are signed by the IRC server using `JWT_SECRET`
+- **Server API Key**: All `/irc/accounts/*` and `/irc/channels/*` endpoints require `X-ObsidianIRC-Key` header
+- **IRC Operator Check**: IRC data endpoints require the user to have operator status (`"o"` in `umodes`)
+- **Password Security**: Passwords are hashed with Argon2id using configurable salt size (`PASSWORD_SALT_SIZE`)
+- **File Uploads**: Require valid JWT but not operator status
+- **Image Expiration**: Automatic cleanup prevents storage abuse
+
+## Image Lifecycle
+
+```
+Upload → Stored (2 minutes) → Automatically Deleted
+```
+
+All uploaded images are **automatically deleted 2 minutes** after upload. This ensures:
+- Privacy protection
+- Disk space management
+- No manual cleanup required
+
 > **Note:** Accessing an expired image URL will return a `404 Not Found` error.
 
 ## Project Structure
 
 ```
 backend/
-├── main.go          # Main server implementation
-├── go.mod           # Go module definition
-├── images/          # Temporary image storage (auto-created)
-├── README.md        # This file
-└── test_image.jpg   # Test file (optional)
+├── main.go              # Main server implementation and routing
+├── auth.go              # JWT and server key authentication middleware
+├── account.go           # Account management endpoints
+├── channel.go           # Channel management endpoints
+├── irc.go               # IRC RPC communication handlers
+├── db.go                # SQLite database operations
+├── go.mod               # Go module definition
+├── go.sum               # Go module checksums
+├── .env                 # Environment variables (create this)
+├── images/              # Temporary image storage (auto-created)
+├── ai_docs/             # Documentation for IRC extensions
+├── README.md            # This file
+└── backend              # Compiled binary (after go build)
 ```
 
 ## Building for Production
 
 ```bash
+# Enable CGO for SQLite support
+export CGO_ENABLED=1
+
 # Build optimized binary
 go build -ldflags="-s -w" -o backend .
 
@@ -195,14 +630,42 @@ curl -I http://localhost:8080/images/{filename_from_response}  # Should return 4
 
 ## Configuration
 
-Currently hardcoded values you can modify in `main.go`:
+### Environment Variables
 
-| Setting | Value | Location |
-|---------|-------|----------|
-| Port | `8080` | `main()` function |
-| Expiration Time | `2 minutes` | `time.AfterFunc(2*time.Minute, ...)` |
-| Max Upload Size | `32MB` | `ParseMultipartForm(32 << 20)` |
-| Image Directory | `images/` | `os.MkdirAll("images", ...)` |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PORT` | `8080` | Server port |
+| `DELETE_TIMEOUT_MINUTES` | `2` | Image auto-deletion time in minutes |
+| `MAX_UPLOAD_SIZE_MB` | `32` | Maximum upload size in MB |
+| `JWT_SECRET` | (required) | Secret key for JWT token verification |
+| `IRC_SERVER_KEY` | (required) | API key for server-only endpoints |
+| `PASSWORD_SALT_SIZE` | `32` | Size of salt for password hashing in bytes |
+| `UNREALIRCD_WS_URL` | `wss://127.0.0.1:8600/` | IRC server WebSocket URL |
+| `UNREALIRCD_API_USERNAME` | `adminpanel` | IRC API username |
+| `UNREALIRCD_API_PASSWORD` | `password` | IRC API password |
+
+### Example .env file
+
+```bash
+PORT=8080
+DELETE_TIMEOUT_MINUTES=2
+MAX_UPLOAD_SIZE_MB=32
+JWT_SECRET=your_jwt_secret_here
+IRC_SERVER_KEY=your_server_key_here
+PASSWORD_SALT_SIZE=32
+UNREALIRCD_WS_URL=wss://127.0.0.1:8600/
+UNREALIRCD_API_USERNAME=adminpanel
+UNREALIRCD_API_PASSWORD=password
+```
+
+### Currently configurable values:
+
+| Setting | Environment Variable | Default |
+|---------|---------------------|---------|
+| Port | `PORT` | `8080` |
+| Image deletion timeout | `DELETE_TIMEOUT_MINUTES` | `2 minutes` |
+| Max upload size | `MAX_UPLOAD_SIZE_MB` | `32MB` |
+| Password salt size | `PASSWORD_SALT_SIZE` | `32 bytes` |
 
 ## Example Use Cases
 
@@ -297,6 +760,13 @@ Open source - use freely for any purpose.
 
 ## Troubleshooting
 
+### SQLite Driver Error
+```bash
+# Enable CGO for SQLite support
+export CGO_ENABLED=1
+go build
+```
+
 ### Port Already in Use
 ```bash
 # Find and kill existing process
@@ -314,6 +784,11 @@ chmod 755 images
 - Ensure server is running: `ps aux | grep backend`
 - Check server logs: `tail -f server.log`
 - Verify port is listening: `netstat -an | grep 8080`
+
+### IRC Connection Issues
+- Verify IRC server is running on port 8600
+- Check `UNREALIRCD_*` environment variables
+- Ensure JSON-RPC is enabled on the IRC server
 
 ## Future Enhancements
 

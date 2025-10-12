@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/gorilla/mux"
 )
 
 type UploadRequest struct {
@@ -24,7 +26,7 @@ func corsHandler(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusOK)
 			return
@@ -63,19 +65,62 @@ func main() {
 	}
 	maxUploadSize := int64(maxUploadSizeMB) << 20
 
-	http.HandleFunc("/upload", func(w http.ResponseWriter, r *http.Request) {
+	// Initialize database
+	if err := InitDB(); err != nil {
+		fmt.Printf("Failed to initialize database: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Initialize IRC connection
+	if err := InitIRCConn(); err != nil {
+		fmt.Printf("Failed to connect to IRC: %v\n", err)
+		// Continue without IRC features
+	}
+
+	r := mux.NewRouter()
+
+	// File upload (requires JWT)
+	r.HandleFunc("/upload", AuthMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		uploadHandler(w, r, port, deleteTimeout, maxUploadSize)
-	})
-	http.Handle("/images/", corsHandler(http.StripPrefix("/images/", http.FileServer(http.Dir("images")))))
+	}, false)).Methods("POST", "OPTIONS")
+
+	// Image serving
+	r.PathPrefix("/images/").Handler(corsHandler(http.StripPrefix("/images/", http.FileServer(http.Dir("images")))))
+
+	// IRC info endpoints (require JWT + IRCop)
+	r.HandleFunc("/irc/users", AuthMiddleware(handleIRCUsers, true)).Methods("GET")
+	r.HandleFunc("/irc/channels", AuthMiddleware(handleIRCChannels, true)).Methods("GET")
+	r.HandleFunc("/irc/bans", AuthMiddleware(handleIRCBans, true)).Methods("GET")
+	r.HandleFunc("/irc/stats", AuthMiddleware(handleIRCStats, true)).Methods("GET")
+	r.HandleFunc("/irc/server-uptime", AuthMiddleware(handleIRCServerUptime, true)).Methods("GET")
+
+	// Account management (require server key)
+	accountRouter := r.PathPrefix("/irc/accounts").Subrouter()
+	accountRouter.Use(ServerAuthMiddleware)
+	accountRouter.HandleFunc("/register", handleRegisterAccount).Methods("POST")
+	accountRouter.HandleFunc("/login", handleLogin).Methods("POST")
+	accountRouter.HandleFunc("/{id}", handleGetAccount).Methods("GET")
+	accountRouter.HandleFunc("/{id}", handleUpdateAccount).Methods("PUT")
+	accountRouter.HandleFunc("/{id}/metadata", handleSetUserMetadata).Methods("POST")
+	accountRouter.HandleFunc("/verify/{code}", handleVerifyEmail).Methods("GET")
+
+	// Channel management (require server key)
+	channelRouter := r.PathPrefix("/irc/channels").Subrouter()
+	channelRouter.Use(ServerAuthMiddleware)
+	channelRouter.HandleFunc("/register", handleRegisterChannel).Methods("POST")
+	channelRouter.HandleFunc("/{id}", handleGetChannel).Methods("GET")
+	channelRouter.HandleFunc("/{id}", handleUpdateChannel).Methods("PUT")
+	channelRouter.HandleFunc("/{id}/metadata", handleSetChannelMetadata).Methods("POST")
+	channelRouter.HandleFunc("/{id}/permissions", handleSetChannelPermissions).Methods("POST")
 
 	fmt.Printf("Server starting on :%s\n", port)
-	http.ListenAndServe(":"+port, nil)
+	http.ListenAndServe(":"+port, r)
 }
 
 func uploadHandler(w http.ResponseWriter, r *http.Request, port string, deleteTimeout time.Duration, maxUploadSize int64) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 
 	fmt.Println("Request method:", r.Method)
 
@@ -83,7 +128,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request, port string, deleteTi
 		fmt.Println("Handling OPTIONS request")
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		w.WriteHeader(http.StatusOK)
 		return
 	}
