@@ -95,6 +95,12 @@ This backend uses multiple authentication methods:
 
 Upload an image using one of three methods. All methods return the same response format.
 
+**Image Processing:** All uploaded images are automatically processed:
+- Resized to fit within 1080p resolution (1920x1080 max)
+- Converted to JPEG format
+- All existing EXIF data is stripped for privacy
+- Custom EXIF data is added containing the uploader's account name and expiration timestamp
+
 #### Method 1: JSON URL Upload
 Perfect for importing images from external sources.
 
