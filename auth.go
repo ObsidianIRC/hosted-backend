@@ -17,15 +17,22 @@ type JWTClaims struct {
 	Sub     string   `json:"sub"`
 	Account string   `json:"account"`
 	Umodes  []string `json:"umodes"`
+	Cmodes  []string `json:"cmodes"`
 	jwt.RegisteredClaims
 }
 
 // AuthMiddleware verifies JWT token and checks for IRCop status
 func AuthMiddleware(next http.HandlerFunc, requireIRCOp bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// Set CORS headers for all responses
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
+		w.Header().Set("Access-Control-Max-Age", "86400")
+
 		// Allow OPTIONS requests for CORS preflight without authentication
 		if r.Method == http.MethodOptions {
-			next(w, r)
+			w.WriteHeader(http.StatusOK)
 			return
 		}
 

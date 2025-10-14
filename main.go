@@ -30,8 +30,9 @@ type UploadResponse struct {
 func corsHandler(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
+		w.Header().Set("Access-Control-Max-Age", "86400") // 24 hours
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusOK)
 			return
@@ -40,64 +41,91 @@ func corsHandler(h http.Handler) http.Handler {
 	})
 }
 
-// processImage resizes image to 1080p, strips EXIF, and adds custom EXIF data
-func processImage(data []byte, author string, expiry time.Time) ([]byte, error) {
+// setCORSHeaders sets comprehensive CORS headers for API endpoints
+func setCORSHeaders(w http.ResponseWriter) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
+	w.Header().Set("Access-Control-Max-Age", "86400") // 24 hours
+}
+
+// processImage processes images based on configuration
+func processImage(data []byte, author string, jwtExpiry time.Time, serverExpiry time.Time, compressionEnabled bool, maxWidth, maxHeight, jpegQuality int, convertToJpeg bool) ([]byte, string, error) {
 	// Decode image
-	img, _, err := image.Decode(bytes.NewReader(data))
+	img, format, err := image.Decode(bytes.NewReader(data))
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
-	// Resize to fit within 1920x1080 (1080p)
-	img = imaging.Fit(img, 1920, 1080, imaging.Lanczos)
+	processed := false
 
-	// Encode to JPEG (strips existing EXIF)
+	// Apply compression if enabled
+	if compressionEnabled {
+		// Resize to fit within configured dimensions
+		img = imaging.Fit(img, maxWidth, maxHeight, imaging.Lanczos)
+		processed = true
+	}
+
+	// Encode based on configuration
 	buf := new(bytes.Buffer)
-	err = jpeg.Encode(buf, img, &jpeg.Options{Quality: 85})
-	if err != nil {
-		return nil, err
+
+	if convertToJpeg || format == "jpeg" || processed {
+		// Convert to JPEG
+		err = jpeg.Encode(buf, img, &jpeg.Options{Quality: jpegQuality})
+		if err != nil {
+			return nil, "", err
+		}
+
+		encoded := buf.Bytes()
+
+		// Add metadata as JPEG comment (author format: nick:account)
+		metadata := map[string]string{
+			"author":       author,
+			"jwt_expiry":   jwtExpiry.Format(time.RFC3339),
+			"server_expiry": serverExpiry.Format(time.RFC3339),
+		}
+		commentBytes, err := json.Marshal(metadata)
+		if err != nil {
+			// Fallback to plain text if JSON marshaling fails
+			comment := "Author: " + author + "; JWT Expires: " + jwtExpiry.Format(time.RFC3339) + "; Server Expires: " + serverExpiry.Format(time.RFC3339)
+			commentBytes = []byte(comment)
+		}
+
+		// Insert COM segment after SOI (FF D8)
+		if len(encoded) >= 2 {
+			comMarker := []byte{0xFF, 0xFE}
+			length := uint16(len(commentBytes) + 2) // +2 for length field
+			lengthBytes := []byte{byte(length >> 8), byte(length)}
+			comSegment := append(comMarker, lengthBytes...)
+			comSegment = append(comSegment, commentBytes...)
+
+			// Insert after SOI
+			result := make([]byte, 0, len(encoded)+len(comSegment))
+			result = append(result, encoded[:2]...)
+			result = append(result, comSegment...)
+			result = append(result, encoded[2:]...)
+			return result, "jpeg", nil
+		}
+
+		return encoded, "jpeg", nil
+	} else {
+		// Keep original format (PNG, GIF, etc.)
+		switch format {
+		case "png":
+			err = imaging.Encode(buf, img, imaging.PNG)
+		case "gif":
+			err = imaging.Encode(buf, img, imaging.GIF)
+		default:
+			// Fallback to JPEG
+			err = jpeg.Encode(buf, img, &jpeg.Options{Quality: jpegQuality})
+		}
+		if err != nil {
+			return nil, "", err
+		}
+		return buf.Bytes(), format, nil
 	}
-
-	encoded := buf.Bytes()
-
-	// Add custom EXIF data
-	exifData := createEXIF(author, expiry)
-
-	// Insert APP1 segment after SOI (FF D8)
-	if len(encoded) >= 2 {
-		app1Marker := []byte{0xFF, 0xE1}
-		length := uint16(len(exifData) + 2) // +2 for length field
-		lengthBytes := []byte{byte(length >> 8), byte(length)}
-		app1Segment := append(app1Marker, lengthBytes...)
-		app1Segment = append(app1Segment, exifData...)
-
-		// Insert after SOI
-		result := make([]byte, 0, len(encoded)+len(app1Segment))
-		result = append(result, encoded[:2]...)
-		result = append(result, app1Segment...)
-		result = append(result, encoded[2:]...)
-		return result, nil
-	}
-
-	return encoded, nil
 }
 
-// createEXIF creates basic EXIF data with author and expiry information
-func createEXIF(author string, expiry time.Time) []byte {
-	desc := "Author: " + author + "; Expires: " + expiry.Format(time.RFC3339)
-	exif := []byte("Exif\x00\x00II*\x00\x08\x00\x00\x00\x01\x00\x0E\x01\x02\x00")
-	descBytes := []byte(desc + "\x00")
-	lenBytes := make([]byte, 4)
-	lenBytes[0] = byte(len(descBytes))
-	lenBytes[1] = byte(len(descBytes) >> 8)
-	offset := []byte{0x16, 0x00, 0x00, 0x00}
-	nextIfd := []byte{0x00, 0x00, 0x00, 0x00}
-	exif = append(exif, lenBytes...)
-	exif = append(exif, offset...)
-	exif = append(exif, nextIfd...)
-	exif = append(exif, descBytes...)
-	return exif
-}
 
 func main() {
 	// Load environment variables from .env file
@@ -134,6 +162,28 @@ func main() {
 	}
 	maxUploadSize := int64(maxUploadSizeMB) << 20
 
+	// Read image processing configuration
+	imageCompressionEnabled := os.Getenv("IMAGE_COMPRESSION_ENABLED") == "true"
+	imageMaxWidth := 1920
+	if widthStr := os.Getenv("IMAGE_MAX_WIDTH"); widthStr != "" {
+		if parsed, err := strconv.Atoi(widthStr); err == nil && parsed > 0 {
+			imageMaxWidth = parsed
+		}
+	}
+	imageMaxHeight := 1080
+	if heightStr := os.Getenv("IMAGE_MAX_HEIGHT"); heightStr != "" {
+		if parsed, err := strconv.Atoi(heightStr); err == nil && parsed > 0 {
+			imageMaxHeight = parsed
+		}
+	}
+	imageJpegQuality := 85
+	if qualityStr := os.Getenv("IMAGE_JPEG_QUALITY"); qualityStr != "" {
+		if parsed, err := strconv.Atoi(qualityStr); err == nil && parsed > 0 && parsed <= 100 {
+			imageJpegQuality = parsed
+		}
+	}
+	imageConvertToJpeg := os.Getenv("IMAGE_CONVERT_TO_JPEG") == "true"
+
 	// Initialize database
 	if err := InitDB(); err != nil {
 		fmt.Printf("Failed to initialize database: %v\n", err)
@@ -150,7 +200,16 @@ func main() {
 
 	// File upload (requires JWT)
 	r.HandleFunc("/upload", AuthMiddleware(func(w http.ResponseWriter, r *http.Request) {
-		uploadHandler(w, r, port, deleteTimeout, maxUploadSize)
+		uploadHandler(w, r, port, deleteTimeout, maxUploadSize, imageCompressionEnabled, imageMaxWidth, imageMaxHeight, imageJpegQuality, imageConvertToJpeg)
+	}, false)).Methods("POST", "OPTIONS")
+
+	// Avatar uploads (require JWT)
+	r.HandleFunc("/upload/avatar/user", AuthMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		uploadUserAvatarHandler(w, r, maxUploadSize, imageCompressionEnabled, imageMaxWidth, imageMaxHeight, imageJpegQuality, imageConvertToJpeg)
+	}, false)).Methods("POST", "OPTIONS")
+
+	r.HandleFunc("/upload/avatar/channel/{channel}", AuthMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		uploadChannelAvatarHandler(w, r, maxUploadSize, imageCompressionEnabled, imageMaxWidth, imageMaxHeight, imageJpegQuality, imageConvertToJpeg)
 	}, false)).Methods("POST", "OPTIONS")
 
 	// Image serving
@@ -186,18 +245,13 @@ func main() {
 	http.ListenAndServe(":"+port, r)
 }
 
-func uploadHandler(w http.ResponseWriter, r *http.Request, port string, deleteTimeout time.Duration, maxUploadSize int64) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+func uploadHandler(w http.ResponseWriter, r *http.Request, port string, deleteTimeout time.Duration, maxUploadSize int64, imageCompressionEnabled bool, imageMaxWidth, imageMaxHeight, imageJpegQuality int, imageConvertToJpeg bool) {
+	setCORSHeaders(w)
 
 	fmt.Println("Request method:", r.Method)
 
 	if r.Method == http.MethodOptions {
 		fmt.Println("Handling OPTIONS request")
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -209,7 +263,14 @@ func uploadHandler(w http.ResponseWriter, r *http.Request, port string, deleteTi
 
 	// Get JWT claims for author info
 	claims := r.Context().Value("jwt_claims").(*JWTClaims)
-	author := claims.Account
+	// Create combined nick:account format
+	nick := claims.Sub
+	account := claims.Account
+	if account == "" {
+		account = "0"
+	}
+	author := nick + ":" + account
+	jwtExpiry := time.Unix(claims.Exp, 0)  // JWT token expiration time
 	expiry := time.Now().Add(deleteTimeout)
 
 	contentType := r.Header.Get("Content-Type")
@@ -237,15 +298,15 @@ func uploadHandler(w http.ResponseWriter, r *http.Request, port string, deleteTi
 		}
 
 		// Process image (resize, strip EXIF, add custom EXIF)
-		processedData, err := processImage(data, author, expiry)
+		processedData, format, err := processImage(data, author, jwtExpiry, expiry, imageCompressionEnabled, imageMaxWidth, imageMaxHeight, imageJpegQuality, imageConvertToJpeg)
 		if err != nil {
 			http.Error(w, "Failed to process image", http.StatusInternalServerError)
 			return
 		}
 
-		// Generate unique filename (always .jpg since we convert to JPEG)
+		// Generate unique filename based on output format
 		timestamp := time.Now().UnixNano()
-		filename := strconv.FormatInt(timestamp, 10) + ".jpg"
+		filename := strconv.FormatInt(timestamp, 10) + "." + format
 		filePath := filepath.Join("images", filename)
 
 		// Save the processed image
@@ -281,15 +342,15 @@ func uploadHandler(w http.ResponseWriter, r *http.Request, port string, deleteTi
 		}
 
 		// Process image (resize, strip EXIF, add custom EXIF)
-		processedData, err := processImage(body, author, expiry)
+		processedData, format, err := processImage(body, author, jwtExpiry, expiry, imageCompressionEnabled, imageMaxWidth, imageMaxHeight, imageJpegQuality, imageConvertToJpeg)
 		if err != nil {
 			http.Error(w, "Failed to process image", http.StatusInternalServerError)
 			return
 		}
 
-		// Generate unique filename (always .jpg since we convert to JPEG)
+		// Generate unique filename based on output format
 		timestamp := time.Now().UnixNano()
-		filename := strconv.FormatInt(timestamp, 10) + ".jpg"
+		filename := strconv.FormatInt(timestamp, 10) + "." + format
 		filePath := filepath.Join("images", filename)
 
 		// Save the processed image
@@ -345,15 +406,15 @@ func uploadHandler(w http.ResponseWriter, r *http.Request, port string, deleteTi
 		}
 
 		// Process image (resize, strip EXIF, add custom EXIF)
-		processedData, err := processImage(data, author, expiry)
+		processedData, format, err := processImage(data, author, jwtExpiry, expiry, imageCompressionEnabled, imageMaxWidth, imageMaxHeight, imageJpegQuality, imageConvertToJpeg)
 		if err != nil {
 			http.Error(w, "Failed to process image", http.StatusInternalServerError)
 			return
 		}
 
-		// Generate unique filename (always .jpg since we convert to JPEG)
+		// Generate unique filename based on output format
 		timestamp := time.Now().UnixNano()
-		filename := strconv.FormatInt(timestamp, 10) + ".jpg"
+		filename := strconv.FormatInt(timestamp, 10) + "." + format
 		filePath := filepath.Join("images", filename)
 
 		// Save the processed image
@@ -383,5 +444,449 @@ func uploadHandler(w http.ResponseWriter, r *http.Request, port string, deleteTi
 	} else {
 		http.Error(w, "Unsupported content type: "+contentType, http.StatusBadRequest)
 		return
+	}
+}
+
+func uploadUserAvatarHandler(w http.ResponseWriter, r *http.Request, maxUploadSize int64, imageCompressionEnabled bool, imageMaxWidth, imageMaxHeight, imageJpegQuality int, imageConvertToJpeg bool) {
+	fmt.Println("uploadUserAvatarHandler called")
+	setCORSHeaders(w)
+
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Get JWT claims
+	claims := r.Context().Value("jwt_claims").(*JWTClaims)
+
+	// Create author string (nick:account format)
+	nick := claims.Sub
+	account := claims.Account
+	if account == "" {
+		account = "0"
+	}
+	author := nick + ":" + account
+
+	contentType := r.Header.Get("Content-Type")
+
+	if strings.Contains(contentType, "multipart/form-data") {
+		// Multipart file upload
+		err := r.ParseMultipartForm(maxUploadSize)
+		if err != nil {
+			http.Error(w, "Failed to parse multipart form: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		uploadedFile, _, err := r.FormFile("image")
+		if err != nil {
+			http.Error(w, "Failed to get uploaded file: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		defer uploadedFile.Close()
+
+		// Read image data
+		data, err := io.ReadAll(uploadedFile)
+		if err != nil {
+			http.Error(w, "Failed to read uploaded file", http.StatusInternalServerError)
+			return
+		}
+
+		// Process image (resize, strip EXIF, add custom EXIF)
+		processedData, format, err := processImage(data, author, time.Now().Add(365*24*time.Hour), time.Now().Add(365*24*time.Hour), imageCompressionEnabled, imageMaxWidth, imageMaxHeight, imageJpegQuality, imageConvertToJpeg)
+		if err != nil {
+			http.Error(w, "Failed to process image", http.StatusInternalServerError)
+			return
+		}
+
+		// Remove old avatar for this account
+		removeOldUserAvatar(account)
+
+		// Generate unique filename
+		timestamp := time.Now().UnixNano()
+		filename := fmt.Sprintf("avatar_user_%s_%d.%s", account, timestamp, format)
+		filePath := filepath.Join("images", filename)
+
+		// Save the processed image
+		file, err := os.Create(filePath)
+		if err != nil {
+			http.Error(w, "Failed to save image", http.StatusInternalServerError)
+			return
+		}
+		defer file.Close()
+
+		_, err = file.Write(processedData)
+		if err != nil {
+			http.Error(w, "Failed to save image", http.StatusInternalServerError)
+			return
+		}
+
+		// Return the saved URL
+		savedURL := fmt.Sprintf("/images/%s", filename)
+		response := UploadResponse{SavedURL: savedURL}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
+
+	} else if strings.HasPrefix(contentType, "image/") {
+		// Raw image upload
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "Failed to read body", http.StatusBadRequest)
+			return
+		}
+
+		// Process image (resize, strip EXIF, add custom EXIF)
+		processedData, format, err := processImage(body, author, time.Now().Add(365*24*time.Hour), time.Now().Add(365*24*time.Hour), imageCompressionEnabled, imageMaxWidth, imageMaxHeight, imageJpegQuality, imageConvertToJpeg)
+		if err != nil {
+			http.Error(w, "Failed to process image", http.StatusInternalServerError)
+			return
+		}
+
+		// Remove old avatar for this account
+		removeOldUserAvatar(claims.Account)
+
+		// Generate unique filename
+		timestamp := time.Now().UnixNano()
+		filename := fmt.Sprintf("avatar_user_%s_%d.%s", claims.Account, timestamp, format)
+		filePath := filepath.Join("images", filename)
+
+		// Save the processed image
+		file, err := os.Create(filePath)
+		if err != nil {
+			http.Error(w, "Failed to save image", http.StatusInternalServerError)
+			return
+		}
+		defer file.Close()
+
+		_, err = file.Write(processedData)
+		if err != nil {
+			http.Error(w, "Failed to save image", http.StatusInternalServerError)
+			return
+		}
+
+		// Return the saved URL
+		savedURL := fmt.Sprintf("/images/%s", filename)
+		response := UploadResponse{SavedURL: savedURL}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
+
+	} else if contentType == "application/json" {
+		// JSON URL upload
+		var req UploadRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid JSON", http.StatusBadRequest)
+			return
+		}
+
+		// Download image from URL
+		resp, err := http.Get(req.URL)
+		if err != nil {
+			http.Error(w, "Failed to download image", http.StatusInternalServerError)
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			http.Error(w, "Failed to download image", http.StatusInternalServerError)
+			return
+		}
+
+		// Read image data
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			http.Error(w, "Failed to read downloaded image", http.StatusInternalServerError)
+			return
+		}
+
+		// Process image (resize, strip EXIF, add custom EXIF)
+		processedData, format, err := processImage(data, author, time.Now().Add(365*24*time.Hour), time.Now().Add(365*24*time.Hour), imageCompressionEnabled, imageMaxWidth, imageMaxHeight, imageJpegQuality, imageConvertToJpeg)
+		if err != nil {
+			http.Error(w, "Failed to process image", http.StatusInternalServerError)
+			return
+		}
+
+		// Remove old avatar for this account
+		removeOldUserAvatar(claims.Account)
+
+		// Generate unique filename
+		timestamp := time.Now().UnixNano()
+		filename := fmt.Sprintf("avatar_user_%s_%d.%s", claims.Account, timestamp, format)
+		filePath := filepath.Join("images", filename)
+
+		// Save the processed image
+		file, err := os.Create(filePath)
+		if err != nil {
+			http.Error(w, "Failed to save image", http.StatusInternalServerError)
+			return
+		}
+		defer file.Close()
+
+		_, err = file.Write(processedData)
+		if err != nil {
+			http.Error(w, "Failed to save image", http.StatusInternalServerError)
+			return
+		}
+
+		// Return the saved URL
+		savedURL := fmt.Sprintf("/images/%s", filename)
+		response := UploadResponse{SavedURL: savedURL}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
+	} else {
+		http.Error(w, "Unsupported content type: "+contentType, http.StatusBadRequest)
+		return
+	}
+}
+
+func uploadChannelAvatarHandler(w http.ResponseWriter, r *http.Request, maxUploadSize int64, imageCompressionEnabled bool, imageMaxWidth, imageMaxHeight, imageJpegQuality int, imageConvertToJpeg bool) {
+	fmt.Println("uploadChannelAvatarHandler called")
+	setCORSHeaders(w)
+
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Get JWT claims
+	claims := r.Context().Value("jwt_claims").(*JWTClaims)
+
+	// Check if account exists
+	if claims.Account == "" {
+		http.Error(w, fmt.Sprintf("Account required for avatar upload. JWT claims: sub=%s, account='%s', umodes=%v, cmodes=%v", claims.Sub, claims.Account, claims.Umodes, claims.Cmodes), http.StatusForbidden)
+		return
+	}
+
+	// Check channel permissions - must have 'o', 'a', or 'q' in cmodes
+	hasPermission := false
+	for _, mode := range claims.Cmodes {
+		if mode == "o" || mode == "a" || mode == "q" {
+			hasPermission = true
+			break
+		}
+	}
+	if !hasPermission {
+		http.Error(w, "Channel operator/admin/owner permission required", http.StatusForbidden)
+		return
+	}
+
+	// Get channel from URL
+	vars := mux.Vars(r)
+	channel := vars["channel"]
+	if channel == "" {
+		http.Error(w, "Channel name required", http.StatusBadRequest)
+		return
+	}
+
+	// Create author string (nick:account format)
+	nick := claims.Sub
+	account := claims.Account
+	if account == "" {
+		account = "0"
+	}
+	author := nick + ":" + account
+
+	contentType := r.Header.Get("Content-Type")
+
+	if strings.Contains(contentType, "multipart/form-data") {
+		// Multipart file upload
+		err := r.ParseMultipartForm(maxUploadSize)
+		if err != nil {
+			http.Error(w, "Failed to parse multipart form: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		uploadedFile, _, err := r.FormFile("image")
+		if err != nil {
+			http.Error(w, "Failed to get uploaded file: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		defer uploadedFile.Close()
+
+		// Read image data
+		data, err := io.ReadAll(uploadedFile)
+		if err != nil {
+			http.Error(w, "Failed to read uploaded file", http.StatusInternalServerError)
+			return
+		}
+
+		// Process image (resize, strip EXIF, add custom EXIF)
+		processedData, format, err := processImage(data, author, time.Now().Add(365*24*time.Hour), time.Now().Add(365*24*time.Hour), imageCompressionEnabled, imageMaxWidth, imageMaxHeight, imageJpegQuality, imageConvertToJpeg)
+		if err != nil {
+			http.Error(w, "Failed to process image", http.StatusInternalServerError)
+			return
+		}
+
+		// Remove old avatar for this channel
+		removeOldChannelAvatar(channel)
+
+		// Generate unique filename
+		timestamp := time.Now().UnixNano()
+		filename := fmt.Sprintf("avatar_channel_%s_%d.%s", strings.ReplaceAll(channel, "#", "_hash_"), timestamp, format)
+		filePath := filepath.Join("images", filename)
+
+		// Save the processed image
+		file, err := os.Create(filePath)
+		if err != nil {
+			http.Error(w, "Failed to save image", http.StatusInternalServerError)
+			return
+		}
+		defer file.Close()
+
+		_, err = file.Write(processedData)
+		if err != nil {
+			http.Error(w, "Failed to save image", http.StatusInternalServerError)
+			return
+		}
+
+		// Return the saved URL
+		savedURL := fmt.Sprintf("/images/%s", filename)
+		response := UploadResponse{SavedURL: savedURL}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
+
+	} else if strings.HasPrefix(contentType, "image/") {
+		// Raw image upload
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "Failed to read body", http.StatusBadRequest)
+			return
+		}
+
+		// Process image (resize, strip EXIF, add custom EXIF)
+		processedData, format, err := processImage(body, author, time.Now().Add(365*24*time.Hour), time.Now().Add(365*24*time.Hour), imageCompressionEnabled, imageMaxWidth, imageMaxHeight, imageJpegQuality, imageConvertToJpeg)
+		if err != nil {
+			http.Error(w, "Failed to process image", http.StatusInternalServerError)
+			return
+		}
+
+		// Remove old avatar for this channel
+		removeOldChannelAvatar(channel)
+
+		// Generate unique filename
+		timestamp := time.Now().UnixNano()
+		filename := fmt.Sprintf("avatar_channel_%s_%d.%s", strings.ReplaceAll(channel, "#", "_hash_"), timestamp, format)
+		filePath := filepath.Join("images", filename)
+
+		// Save the processed image
+		file, err := os.Create(filePath)
+		if err != nil {
+			http.Error(w, "Failed to save image", http.StatusInternalServerError)
+			return
+		}
+		defer file.Close()
+
+		_, err = file.Write(processedData)
+		if err != nil {
+			http.Error(w, "Failed to save image", http.StatusInternalServerError)
+			return
+		}
+
+		// Return the saved URL
+		savedURL := fmt.Sprintf("/images/%s", filename)
+		response := UploadResponse{SavedURL: savedURL}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
+
+	} else if contentType == "application/json" {
+		// JSON URL upload
+		var req UploadRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "Invalid JSON", http.StatusBadRequest)
+			return
+		}
+
+		// Download image from URL
+		resp, err := http.Get(req.URL)
+		if err != nil {
+			http.Error(w, "Failed to download image", http.StatusInternalServerError)
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			http.Error(w, "Failed to download image", http.StatusInternalServerError)
+			return
+		}
+
+		// Read image data
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			http.Error(w, "Failed to read downloaded image", http.StatusInternalServerError)
+			return
+		}
+
+		// Process image (resize, strip EXIF, add custom EXIF)
+		processedData, format, err := processImage(data, author, time.Now().Add(365*24*time.Hour), time.Now().Add(365*24*time.Hour), imageCompressionEnabled, imageMaxWidth, imageMaxHeight, imageJpegQuality, imageConvertToJpeg)
+		if err != nil {
+			http.Error(w, "Failed to process image", http.StatusInternalServerError)
+			return
+		}
+
+		// Remove old avatar for this channel
+		removeOldChannelAvatar(channel)
+
+		// Generate unique filename
+		timestamp := time.Now().UnixNano()
+		filename := fmt.Sprintf("avatar_channel_%s_%d.%s", strings.ReplaceAll(channel, "#", "_hash_"), timestamp, format)
+		filePath := filepath.Join("images", filename)
+
+		// Save the processed image
+		file, err := os.Create(filePath)
+		if err != nil {
+			http.Error(w, "Failed to save image", http.StatusInternalServerError)
+			return
+		}
+		defer file.Close()
+
+		_, err = file.Write(processedData)
+		if err != nil {
+			http.Error(w, "Failed to save image", http.StatusInternalServerError)
+			return
+		}
+
+		// Return the saved URL
+		savedURL := fmt.Sprintf("/images/%s", filename)
+		response := UploadResponse{SavedURL: savedURL}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(response)
+	} else {
+		http.Error(w, "Unsupported content type: "+contentType, http.StatusBadRequest)
+		return
+	}
+}
+
+func removeOldUserAvatar(account string) {
+	files, err := os.ReadDir("images")
+	if err != nil {
+		return
+	}
+
+	for _, file := range files {
+		if strings.HasPrefix(file.Name(), "avatar_user_"+account+"_") {
+			os.Remove(filepath.Join("images", file.Name()))
+		}
+	}
+}
+
+func removeOldChannelAvatar(channel string) {
+	files, err := os.ReadDir("images")
+	if err != nil {
+		return
+	}
+
+	safeChannel := strings.ReplaceAll(channel, "#", "_hash_")
+	for _, file := range files {
+		if strings.HasPrefix(file.Name(), "avatar_channel_"+safeChannel+"_") {
+			os.Remove(filepath.Join("images", file.Name()))
+		}
 	}
 }
