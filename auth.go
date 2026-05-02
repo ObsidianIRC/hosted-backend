@@ -1,16 +1,15 @@
 package main
 
 import (
-	"context"
-	"fmt"
 	"net/http"
 	"os"
-	"strings"
-
-	"github.com/golang-jwt/jwt/v5"
 )
 
-// JWTClaims represents the claims in the extjwt token
+// JWTClaims is the legacy claims shape used by handlers that pre-date
+// the move to draft/authtoken.  It is now populated from TOKEN
+// VALIDATE results (see tokenauth.go) so existing handlers keep
+// working without changes.  New code should prefer
+// TokenClaimsFromCtx().
 type JWTClaims struct {
 	Exp     int64    `json:"exp"`
 	Iss     string   `json:"iss"`
@@ -18,89 +17,22 @@ type JWTClaims struct {
 	Account string   `json:"account"`
 	Umodes  []string `json:"umodes"`
 	Cmodes  []string `json:"cmodes"`
-	jwt.RegisteredClaims
 }
 
-// AuthMiddleware verifies JWT token and checks for IRCop status
+// AuthMiddleware validates the request's bearer token via the IRC
+// server's draft/authtoken `TOKEN VALIDATE` flow and, if successful,
+// injects a legacy JWTClaims into the request context as `jwt_claims`.
+//
+// This is a thin wrapper around TokenAuthMiddleware; it exists so the
+// existing call sites in main.go continue to compile unchanged.
 func AuthMiddleware(next http.HandlerFunc, requireIRCOp bool) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		// Set CORS headers for all responses
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
-		w.Header().Set("Access-Control-Max-Age", "86400")
-
-		// Allow OPTIONS requests for CORS preflight without authentication
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-
-		authHeader := r.Header.Get("Authorization")
-		if authHeader == "" {
-			http.Error(w, "Authorization header required", http.StatusUnauthorized)
-			return
-		}
-
-		tokenString := strings.TrimPrefix(authHeader, "Bearer ")
-		if tokenString == authHeader {
-			http.Error(w, "Bearer token required", http.StatusUnauthorized)
-			return
-		}
-
-		secret := os.Getenv("JWT_SECRET")
-		if secret == "" {
-			http.Error(w, "JWT secret not configured", http.StatusInternalServerError)
-			return
-		}
-
-		token, err := jwt.ParseWithClaims(tokenString, &JWTClaims{}, func(token *jwt.Token) (interface{}, error) {
-			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-				return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
-			}
-			return []byte(secret), nil
-		})
-
-		if err != nil {
-			http.Error(w, "Invalid token: "+err.Error(), http.StatusUnauthorized)
-			return
-		}
-
-		if !token.Valid {
-			http.Error(w, "Invalid token", http.StatusUnauthorized)
-			return
-		}
-
-		claims, ok := token.Claims.(*JWTClaims)
-		if !ok {
-			http.Error(w, "Invalid token claims", http.StatusUnauthorized)
-			return
-		}
-
-		// Check if IRCop required
-		if requireIRCOp {
-			isIRCOp := false
-			for _, mode := range claims.Umodes {
-				if mode == "o" {
-					isIRCOp = true
-					break
-				}
-			}
-			if !isIRCOp {
-				http.Error(w, "IRCop status required", http.StatusForbidden)
-				return
-			}
-		}
-
-		// Add claims to context
-		ctx := context.WithValue(r.Context(), "jwt_claims", claims)
-		r = r.WithContext(ctx)
-
-		next(w, r)
-	}
+	return TokenAuthMiddleware(next, requireIRCOp)
 }
 
-// ServerAuthMiddleware verifies X-ObsidianIRC-Key header
+// ServerAuthMiddleware verifies the X-ObsidianIRC-Key header that
+// IRCds use to call backend endpoints (server-to-backend trust).
+// Unrelated to user auth so it stays untouched by the authtoken
+// migration.
 func ServerAuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		key := r.Header.Get("X-ObsidianIRC-Key")

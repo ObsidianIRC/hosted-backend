@@ -241,6 +241,23 @@ func main() {
 	channelRouter.HandleFunc("/{id}/metadata", handleSetChannelMetadata).Methods("POST")
 	channelRouter.HandleFunc("/{id}/permissions", handleSetChannelPermissions).Methods("POST")
 
+	// Custom-emoji (IRCv3 draft/custom-emoji).  Pack documents are
+	// served unauthenticated -- they're public per spec -- while the
+	// admin endpoints require an IRC operator token.
+	r.HandleFunc("/emoji/pack.json", handleEmojiPack).Methods("GET")
+	r.HandleFunc("/emoji/channel/{channel}.json",
+		handleEmojiChannelPack).Methods("GET")
+	r.HandleFunc("/emoji/admin/packs",
+		AuthMiddleware(handleListPacks, true)).Methods("GET")
+	r.HandleFunc("/emoji/admin/packs",
+		AuthMiddleware(handleCreatePack, true)).Methods("POST")
+	r.HandleFunc("/emoji/admin/packs/{packId}",
+		AuthMiddleware(handleDeletePack, true)).Methods("DELETE")
+	r.HandleFunc("/emoji/admin/packs/{packId}/emoji",
+		AuthMiddleware(handleAddEmoji, true)).Methods("POST")
+	r.HandleFunc("/emoji/admin/packs/{packId}/emoji/{shortcode}",
+		AuthMiddleware(handleDeleteEmoji, true)).Methods("DELETE")
+
 	fmt.Printf("Server starting on :%s\n", port)
 	http.ListenAndServe(":"+port, r)
 }

@@ -138,6 +138,32 @@ func createTables() error {
 			verified BOOLEAN DEFAULT FALSE,
 			FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 		)`,
+		// Custom-emoji packs (IRCv3 draft/custom-emoji).  pack_id is
+		// the spec's external identifier and is what shows up inside
+		// the published JSON document; it must be unique across all
+		// packs we serve.  homepage / required arrays are stored as
+		// JSON-encoded strings to keep the schema simple.
+		`CREATE TABLE IF NOT EXISTS emoji_packs (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			pack_id TEXT UNIQUE NOT NULL,
+			name TEXT NOT NULL,
+			description TEXT,
+			authors TEXT,
+			homepage TEXT,
+			required TEXT,
+			scope TEXT NOT NULL DEFAULT 'server',
+			channel_name TEXT,
+			updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE TABLE IF NOT EXISTS emojis (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			pack_id INTEGER NOT NULL,
+			shortcode TEXT NOT NULL,
+			url TEXT NOT NULL,
+			alt TEXT,
+			FOREIGN KEY (pack_id) REFERENCES emoji_packs(id) ON DELETE CASCADE,
+			UNIQUE(pack_id, shortcode)
+		)`,
 	}
 
 	for _, query := range tables {
