@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"image"
@@ -195,6 +196,16 @@ func main() {
 		fmt.Printf("Failed to connect to IRC: %v\n", err)
 		// Continue without IRC features
 	}
+
+	// Voice subsystem: embedded TURN + WebRTC SFU + Unix-socket
+	// bridge for obbyircd's voice-channels module.  No-ops with a
+	// log line if VOICE_TURN_SECRET is unset.
+	voiceCtx, voiceCancel := context.WithCancel(context.Background())
+	voiceShutdown := startVoiceSubsystem(voiceCtx)
+	defer func() {
+		voiceCancel()
+		voiceShutdown()
+	}()
 
 	r := mux.NewRouter()
 
