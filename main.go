@@ -152,15 +152,20 @@ func main() {
 	}
 	deleteTimeout := time.Duration(deleteTimeoutMinutes) * time.Minute
 
-	// Read max upload size from environment variable, default to 32MB
+	// Read max upload size from environment variable, default to 100MB
+	// (videos and audio routinely exceed the old 32MB ceiling).
 	maxUploadSizeStr := os.Getenv("MAX_UPLOAD_SIZE_MB")
-	maxUploadSizeMB := 32
+	maxUploadSizeMB := 100
 	if maxUploadSizeStr != "" {
 		if parsed, err := strconv.Atoi(maxUploadSizeStr); err == nil {
 			maxUploadSizeMB = parsed
 		}
 	}
 	maxUploadSize := int64(maxUploadSizeMB) << 20
+
+	// Multimedia config: allowed extensions, ClamAV scanning, etc.
+	mediaCfg := loadMediaConfig(maxUploadSize)
+	ensureUploadsDir()
 
 	// Read image processing configuration
 	imageCompressionEnabled := os.Getenv("IMAGE_COMPRESSION_ENABLED") == "true"
@@ -200,8 +205,27 @@ func main() {
 
 	// File upload (requires JWT)
 	r.HandleFunc("/upload", AuthMiddleware(func(w http.ResponseWriter, r *http.Request) {
-		uploadHandler(w, r, port, deleteTimeout, maxUploadSize, imageCompressionEnabled, imageMaxWidth, imageMaxHeight, imageJpegQuality, imageConvertToJpeg)
+		uploadHandler(w, r, port, deleteTimeout, mediaCfg, imageCompressionEnabled, imageMaxWidth, imageMaxHeight, imageJpegQuality, imageConvertToJpeg)
 	}, false)).Methods("POST", "OPTIONS")
+
+	// Public upload-policy discovery so clients can pre-validate
+	// before pushing bytes.  No auth required: the policy is the
+	// same for every authenticated caller, and the values are not
+	// secret.
+	r.HandleFunc("/upload/info", func(w http.ResponseWriter, r *http.Request) {
+		setCORSHeaders(w)
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "public, max-age=60")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"max_size":           mediaCfg.MaxUploadBytes,
+			"allowed_extensions": mediaCfg.SortedExtensions(),
+			"scanning_enabled":   mediaCfg.ClamAVEnabled,
+		})
+	}).Methods("GET", "OPTIONS")
 
 	// Avatar uploads (require JWT)
 	r.HandleFunc("/upload/avatar/user", AuthMiddleware(func(w http.ResponseWriter, r *http.Request) {
@@ -212,8 +236,10 @@ func main() {
 		uploadChannelAvatarHandler(w, r, maxUploadSize, imageCompressionEnabled, imageMaxWidth, imageMaxHeight, imageJpegQuality, imageConvertToJpeg)
 	}, false)).Methods("POST", "OPTIONS")
 
-	// Image serving
+	// Image serving (kept for back-compat with old links)
 	r.PathPrefix("/images/").Handler(corsHandler(http.StripPrefix("/images/", http.FileServer(http.Dir("images")))))
+	// Generic media serving (videos, audio, and new image uploads)
+	r.PathPrefix("/uploads/").Handler(corsHandler(http.StripPrefix("/uploads/", http.FileServer(http.Dir(uploadsDir)))))
 
 	// IRC info endpoints (require JWT + IRCop)
 	r.HandleFunc("/irc/users", AuthMiddleware(handleIRCUsers, true)).Methods("GET")
@@ -245,206 +271,190 @@ func main() {
 	http.ListenAndServe(":"+port, r)
 }
 
-func uploadHandler(w http.ResponseWriter, r *http.Request, port string, deleteTimeout time.Duration, maxUploadSize int64, imageCompressionEnabled bool, imageMaxWidth, imageMaxHeight, imageJpegQuality int, imageConvertToJpeg bool) {
+func uploadHandler(w http.ResponseWriter, r *http.Request, port string, deleteTimeout time.Duration, mediaCfg MediaConfig, imageCompressionEnabled bool, imageMaxWidth, imageMaxHeight, imageJpegQuality int, imageConvertToJpeg bool) {
 	setCORSHeaders(w)
 
-	fmt.Println("Request method:", r.Method)
-
 	if r.Method == http.MethodOptions {
-		fmt.Println("Handling OPTIONS request")
 		w.WriteHeader(http.StatusOK)
 		return
 	}
-
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// Get JWT claims for author info
+	// Author info from the auth middleware -- carried forward into
+	// EXIF strip / image-processing for parity with the old behaviour.
 	claims := r.Context().Value("jwt_claims").(*JWTClaims)
-	// Create combined nick:account format
 	nick := claims.Sub
 	account := claims.Account
 	if account == "" {
 		account = "0"
 	}
 	author := nick + ":" + account
-	jwtExpiry := time.Unix(claims.Exp, 0)  // JWT token expiration time
+	jwtExpiry := time.Unix(claims.Exp, 0)
 	expiry := time.Now().Add(deleteTimeout)
 
-	contentType := r.Header.Get("Content-Type")
+	// Pull the upload's bytes + filename out of whichever content
+	// type the client used.  We accept the modern multipart form
+	// ("file" or legacy "image" field), raw image bodies, and JSON
+	// URL pulls.
+	var (
+		data        []byte
+		filename    string
+		contentType = r.Header.Get("Content-Type")
+	)
 
-	if strings.Contains(contentType, "multipart/form-data") {
-		// Multipart file upload
-		err := r.ParseMultipartForm(maxUploadSize) // Configurable max size
-		if err != nil {
+	switch {
+	case strings.Contains(contentType, "multipart/form-data"):
+		if err := r.ParseMultipartForm(mediaCfg.MaxUploadBytes); err != nil {
 			http.Error(w, "Failed to parse multipart form: "+err.Error(), http.StatusBadRequest)
 			return
 		}
-
-		uploadedFile, _, err := r.FormFile("image")
+		field := "file"
+		uploaded, header, err := r.FormFile(field)
 		if err != nil {
-			http.Error(w, "Failed to get uploaded file: "+err.Error(), http.StatusBadRequest)
-			return
+			// Back-compat: old clients use "image".
+			field = "image"
+			uploaded, header, err = r.FormFile(field)
+			if err != nil {
+				http.Error(w, "Failed to get uploaded file: "+err.Error(), http.StatusBadRequest)
+				return
+			}
 		}
-		defer uploadedFile.Close()
-
-		// Read image data
-		data, err := io.ReadAll(uploadedFile)
+		defer uploaded.Close()
+		filename = header.Filename
+		data, err = io.ReadAll(uploaded)
 		if err != nil {
 			http.Error(w, "Failed to read uploaded file", http.StatusInternalServerError)
 			return
 		}
-
-		// Process image (resize, strip EXIF, add custom EXIF)
-		processedData, format, err := processImage(data, author, jwtExpiry, expiry, imageCompressionEnabled, imageMaxWidth, imageMaxHeight, imageJpegQuality, imageConvertToJpeg)
-		if err != nil {
-			http.Error(w, "Failed to process image", http.StatusInternalServerError)
-			return
-		}
-
-		// Generate unique filename based on output format
-		timestamp := time.Now().UnixNano()
-		filename := strconv.FormatInt(timestamp, 10) + "." + format
-		filePath := filepath.Join("images", filename)
-
-		// Save the processed image
-		file, err := os.Create(filePath)
-		if err != nil {
-			http.Error(w, "Failed to save image", http.StatusInternalServerError)
-			return
-		}
-		defer file.Close()
-
-		_, err = file.Write(processedData)
-		if err != nil {
-			http.Error(w, "Failed to save image", http.StatusInternalServerError)
-			return
-		}
-
-		// Schedule deletion after specified timeout
-		time.AfterFunc(deleteTimeout, func() {
-			os.Remove(filePath)
-		})
-
-		// Return the saved URL
-		savedURL := fmt.Sprintf("/images/%s", filename)
-		response := UploadResponse{SavedURL: savedURL}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(response)
-	} else if strings.HasPrefix(contentType, "image/") {
-		// Raw image upload
-		body, err := io.ReadAll(r.Body)
+	case strings.HasPrefix(contentType, "image/"):
+		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, mediaCfg.MaxUploadBytes))
 		if err != nil {
 			http.Error(w, "Failed to read body", http.StatusBadRequest)
 			return
 		}
-
-		// Process image (resize, strip EXIF, add custom EXIF)
-		processedData, format, err := processImage(body, author, jwtExpiry, expiry, imageCompressionEnabled, imageMaxWidth, imageMaxHeight, imageJpegQuality, imageConvertToJpeg)
-		if err != nil {
-			http.Error(w, "Failed to process image", http.StatusInternalServerError)
-			return
-		}
-
-		// Generate unique filename based on output format
-		timestamp := time.Now().UnixNano()
-		filename := strconv.FormatInt(timestamp, 10) + "." + format
-		filePath := filepath.Join("images", filename)
-
-		// Save the processed image
-		file, err := os.Create(filePath)
-		if err != nil {
-			http.Error(w, "Failed to save image", http.StatusInternalServerError)
-			return
-		}
-		defer file.Close()
-
-		_, err = file.Write(processedData)
-		if err != nil {
-			http.Error(w, "Failed to save image", http.StatusInternalServerError)
-			return
-		}
-
-		// Schedule deletion after specified timeout
-		time.AfterFunc(deleteTimeout, func() {
-			os.Remove(filePath)
-		})
-
-		// Return the saved URL
-		savedURL := fmt.Sprintf("/images/%s", filename)
-		response := UploadResponse{SavedURL: savedURL}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(response)
-	} else if strings.Contains(contentType, "application/json") {
-		// JSON URL upload
+		// Pick a sensible extension from the MIME so allowlist / magic
+		// validation has something to check against.
+		filename = "raw" + extFromMime(contentType)
+		data = body
+	case strings.Contains(contentType, "application/json"):
 		var req UploadRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "Invalid JSON", http.StatusBadRequest)
 			return
 		}
-
-		// URL upload
 		resp, err := http.Get(req.URL)
-		if err != nil {
-			http.Error(w, "Failed to download image", http.StatusInternalServerError)
+		if err != nil || resp.StatusCode != http.StatusOK {
+			http.Error(w, "Failed to download upload", http.StatusInternalServerError)
 			return
 		}
 		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
-			http.Error(w, "Failed to download image", http.StatusInternalServerError)
-			return
-		}
-
-		// Read image data
-		data, err := io.ReadAll(resp.Body)
+		body, err := io.ReadAll(io.LimitReader(resp.Body, mediaCfg.MaxUploadBytes))
 		if err != nil {
-			http.Error(w, "Failed to read downloaded image", http.StatusInternalServerError)
+			http.Error(w, "Failed to read downloaded upload", http.StatusInternalServerError)
 			return
 		}
+		filename = filepath.Base(req.URL)
+		data = body
+	default:
+		http.Error(w, "Unsupported content type: "+contentType, http.StatusBadRequest)
+		return
+	}
 
-		// Process image (resize, strip EXIF, add custom EXIF)
-		processedData, format, err := processImage(data, author, jwtExpiry, expiry, imageCompressionEnabled, imageMaxWidth, imageMaxHeight, imageJpegQuality, imageConvertToJpeg)
+	if int64(len(data)) > mediaCfg.MaxUploadBytes {
+		http.Error(w, "Upload exceeds the configured size limit",
+			http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	// Allowlist + magic-byte check before we touch the disk.
+	ext := strings.ToLower(filepath.Ext(filename))
+	if !mediaCfg.IsAllowed(ext) {
+		http.Error(w,
+			"File extension not allowed (see GET /upload/info)",
+			http.StatusUnsupportedMediaType)
+		return
+	}
+	if err := detectAndValidate(data, ext); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	// Two save paths: images go through the existing EXIF strip +
+	// resize pipeline (which may rewrite to a different output
+	// extension), everything else lands on disk untouched.
+	var (
+		savedPath string
+		savedURL  string
+	)
+	if mediaCfg.Kind(ext) == "image" {
+		processed, format, err := processImage(data, author, jwtExpiry, expiry,
+			imageCompressionEnabled, imageMaxWidth, imageMaxHeight,
+			imageJpegQuality, imageConvertToJpeg)
 		if err != nil {
 			http.Error(w, "Failed to process image", http.StatusInternalServerError)
 			return
 		}
-
-		// Generate unique filename based on output format
-		timestamp := time.Now().UnixNano()
-		filename := strconv.FormatInt(timestamp, 10) + "." + format
-		filePath := filepath.Join("images", filename)
-
-		// Save the processed image
-		file, err := os.Create(filePath)
-		if err != nil {
-			http.Error(w, "Failed to save image", http.StatusInternalServerError)
+		suffix, _ := randomHex(4)
+		filename := strconv.FormatInt(time.Now().UnixNano(), 10) +
+			"-" + suffix + "." + format
+		savedPath = uploadsPath(filename)
+		if err := os.WriteFile(savedPath, processed, 0o644); err != nil {
+			http.Error(w, "Failed to save upload", http.StatusInternalServerError)
 			return
 		}
-		defer file.Close()
-
-		_, err = file.Write(processedData)
-		if err != nil {
-			http.Error(w, "Failed to save image", http.StatusInternalServerError)
-			return
-		}
-
-		// Schedule deletion after specified timeout
-		time.AfterFunc(deleteTimeout, func() {
-			os.Remove(filePath)
-		})
-
-		// Return the saved URL
-		savedURL := fmt.Sprintf("/images/%s", filename)
-		response := UploadResponse{SavedURL: savedURL}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(response)
+		savedURL = "/uploads/" + filename
 	} else {
-		http.Error(w, "Unsupported content type: "+contentType, http.StatusBadRequest)
+		suffix, _ := randomHex(4)
+		filename := strconv.FormatInt(time.Now().UnixNano(), 10) +
+			"-" + suffix + ext
+		savedPath = uploadsPath(filename)
+		if err := os.WriteFile(savedPath, data, 0o644); err != nil {
+			http.Error(w, "Failed to save upload", http.StatusInternalServerError)
+			return
+		}
+		savedURL = "/uploads/" + filename
+	}
+
+	// Optional virus scan after the file is on disk -- the scanner
+	// needs a path it can read and we want the same scrubber for
+	// uploads regardless of how they got here (form, raw body, URL).
+	if err := scanWithClamAV(mediaCfg, savedPath); err != nil {
+		_ = os.Remove(savedPath)
+		http.Error(w, err.Error(), http.StatusForbidden)
 		return
 	}
+
+	time.AfterFunc(deleteTimeout, func() {
+		_ = os.Remove(savedPath)
+	})
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(UploadResponse{SavedURL: savedURL})
+}
+
+// extFromMime maps a few common image MIME types to file extensions.
+// Anything we don't recognise gets ".bin", which the allowlist will
+// reject -- that's the desired outcome for opaque content.
+func extFromMime(mime string) string {
+	mime = strings.ToLower(mime)
+	switch {
+	case strings.HasPrefix(mime, "image/jpeg"):
+		return ".jpg"
+	case strings.HasPrefix(mime, "image/png"):
+		return ".png"
+	case strings.HasPrefix(mime, "image/gif"):
+		return ".gif"
+	case strings.HasPrefix(mime, "image/webp"):
+		return ".webp"
+	case strings.HasPrefix(mime, "image/avif"):
+		return ".avif"
+	case strings.HasPrefix(mime, "image/bmp"):
+		return ".bmp"
+	}
+	return ".bin"
 }
 
 func uploadUserAvatarHandler(w http.ResponseWriter, r *http.Request, maxUploadSize int64, imageCompressionEnabled bool, imageMaxWidth, imageMaxHeight, imageJpegQuality int, imageConvertToJpeg bool) {
