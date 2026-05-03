@@ -1,0 +1,10 @@
+.git
+.github
+.vscode
+.idea
+*.swp
+*.bak
+*.log
+irc_backend.db
+backend
+/out

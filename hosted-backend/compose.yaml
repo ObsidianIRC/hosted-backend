@@ -1,0 +1,33 @@
+services:
+  hosted-backend:
+    build:
+      context: .
+      dockerfile: ./Dockerfile
+    image: hosted-backend:local
+    container_name: hosted-backend
+    restart: unless-stopped
+    expose:
+      - "8080"
+    ports:
+      - "3478:3478/udp"
+    volumes:
+      - backend_data:/app/data
+      - backend_images:/app/images
+      - obbyircd_voice_bridge:/run/obbyirc
+    environment:
+      PORT: "8080"
+      VOICE_BRIDGE_SOCKET: /run/obbyirc/voice.sock
+      VOICE_TURN_SECRET: ${VOICE_TURN_SECRET}
+      VOICE_PUBLIC_IP: ${VOICE_PUBLIC_IP}
+      VOICE_TURN_PORT: "3478"
+      VOICE_MAX_ROOM: "25"
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.backend.rule=Host(`${API_FQDN}`)
+      - traefik.http.routers.backend.tls=true
+      - traefik.http.services.backend.loadbalancer.server.port=8080
+
+volumes:
+  backend_data:
+  backend_images:
+  obbyircd_voice_bridge:
