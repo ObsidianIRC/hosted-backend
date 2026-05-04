@@ -9,6 +9,7 @@ import (
 	"image/jpeg"
 	"io"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -278,6 +279,12 @@ func main() {
 	channelRouter.HandleFunc("/{id}/metadata", handleSetChannelMetadata).Methods("POST")
 	channelRouter.HandleFunc("/{id}/permissions", handleSetChannelPermissions).Methods("POST")
 
+	// pprof on loopback only -- useful for diagnosing runaway memory
+	// without exposing it externally.  curl 127.0.0.1:6060/debug/pprof/heap
+	go func() {
+		_ = http.ListenAndServe("127.0.0.1:6060", nil)
+	}()
+
 	fmt.Printf("Server starting on :%s\n", port)
 	http.ListenAndServe(":"+port, r)
 }
@@ -316,9 +323,25 @@ func uploadHandler(w http.ResponseWriter, r *http.Request, port string, deleteTi
 		contentType = r.Header.Get("Content-Type")
 	)
 
+	// Hard cap the request body up front. ParseMultipartForm's
+	// "maxMemory" arg is only the RAM/disk-spill threshold, not a
+	// total body limit -- without this guard a runaway upload (or an
+	// attacker) reads the entire body and OOMs the process before the
+	// post-parse size check can ever fire.  We allow ~2x the file
+	// limit + a small header budget to cover the dual "file" + "image"
+	// form fields the multimedia client posts.
+	bodyLimit := mediaCfg.MaxUploadBytes*2 + 1<<20
+	r.Body = http.MaxBytesReader(w, r.Body, bodyLimit)
+
 	switch {
 	case strings.Contains(contentType, "multipart/form-data"):
-		if err := r.ParseMultipartForm(mediaCfg.MaxUploadBytes); err != nil {
+		// maxMemory = 0 forces every part to spill to a temp file
+		// after Go's internal 10MB threshold, so we never hold the
+		// whole upload in memory. Without this, bytes.Buffer.grow()
+		// doubles capacity per file part (and the multimedia client
+		// posts the same file *twice* under "file" and "image"),
+		// turning a 100MB upload into ~800MB of transient heap.
+		if err := r.ParseMultipartForm(0); err != nil {
 			http.Error(w, "Failed to parse multipart form: "+err.Error(), http.StatusBadRequest)
 			return
 		}
