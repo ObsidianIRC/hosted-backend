@@ -17,6 +17,7 @@
 package main
 
 import (
+	cryptorand "crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -240,14 +241,12 @@ func scanWithClamAV(mc MediaConfig, path string) error {
 // nanosecond timestamp.
 func randomHex(n int) (string, error) {
 	buf := make([]byte, n)
-	if _, err := os.ReadFile("/dev/urandom"); err == nil {
-		f, err := os.Open("/dev/urandom")
-		if err == nil {
-			defer f.Close()
-			if _, err := f.Read(buf); err == nil {
-				return hex.EncodeToString(buf), nil
-			}
-		}
+	// crypto/rand.Read uses getrandom(2) on Linux, which returns
+	// after exactly len(buf) bytes -- unlike os.ReadFile("/dev/urandom"),
+	// which would try to read the entire (infinite) stream and OOM
+	// the process.
+	if _, err := cryptorand.Read(buf); err == nil {
+		return hex.EncodeToString(buf), nil
 	}
 	// Fallback: not cryptographically strong but good enough for a
 	// filename suffix.
