@@ -120,6 +120,7 @@ func mintTurnCreds(cfg VoiceConfig, account string, ttl time.Duration) TurnCreds
 	}
 	urls := []string{
 		fmt.Sprintf("turn:%s:%d?transport=udp", host, cfg.TurnPort),
+		fmt.Sprintf("turn:%s:%d?transport=tcp", host, cfg.TurnPort),
 	}
 	return TurnCreds{
 		Username: username,
@@ -164,33 +165,64 @@ func startTurnServer(cfg VoiceConfig) (*turn.Server, error) {
 			"VOICE_TURN_SECRET must be set to enable TURN")
 	}
 	addr := fmt.Sprintf("0.0.0.0:%d", cfg.TurnPort)
-	udpConn, err := net.ListenPacket("udp4", addr)
-	if err != nil {
-		return nil, fmt.Errorf("turn: udp listen %s: %w", addr, err)
-	}
 	publicIP := cfg.PublicIP
 	if publicIP == "" {
 		publicIP = "127.0.0.1"
 	}
-	srv, err := turn.NewServer(turn.ServerConfig{
+	relayGen := &turn.RelayAddressGeneratorStatic{
+		RelayAddress: net.ParseIP(publicIP),
+		Address:      "0.0.0.0",
+	}
+
+	srvCfg := turn.ServerConfig{
 		Realm:       cfg.Realm,
 		AuthHandler: turnAuthHandler(cfg),
-		PacketConnConfigs: []turn.PacketConnConfig{
-			{
-				PacketConn: udpConn,
-				RelayAddressGenerator: &turn.RelayAddressGeneratorStatic{
-					RelayAddress: net.ParseIP(publicIP),
-					Address:      "0.0.0.0",
-				},
-			},
-		},
-	})
+	}
+
+	// UDP listener -- only useful if the host's firewall actually
+	// permits UDP on TurnPort.  We attempt to bind and skip silently
+	// if it fails, so a TCP-only deployment still starts.
+	udpConn, udpErr := net.ListenPacket("udp4", addr)
+	if udpErr == nil {
+		srvCfg.PacketConnConfigs = append(srvCfg.PacketConnConfigs,
+			turn.PacketConnConfig{
+				PacketConn:            udpConn,
+				RelayAddressGenerator: relayGen,
+			})
+		log.Printf("voice: TURN UDP listening on %s", addr)
+	} else {
+		log.Printf("voice: TURN UDP %s: %v (continuing TCP-only)", addr, udpErr)
+	}
+
+	// TCP listener -- needed in firewall-restricted environments where
+	// only TCP ports are open inbound.
+	tcpLn, tcpErr := net.Listen("tcp4", addr)
+	if tcpErr == nil {
+		srvCfg.ListenerConfigs = append(srvCfg.ListenerConfigs,
+			turn.ListenerConfig{
+				Listener:              tcpLn,
+				RelayAddressGenerator: relayGen,
+			})
+		log.Printf("voice: TURN TCP listening on %s", addr)
+	} else {
+		log.Printf("voice: TURN TCP %s: %v", addr, tcpErr)
+	}
+
+	if udpErr != nil && tcpErr != nil {
+		return nil, fmt.Errorf("turn: neither UDP nor TCP could bind %s", addr)
+	}
+
+	srv, err := turn.NewServer(srvCfg)
 	if err != nil {
-		_ = udpConn.Close()
+		if udpConn != nil {
+			_ = udpConn.Close()
+		}
+		if tcpLn != nil {
+			_ = tcpLn.Close()
+		}
 		return nil, fmt.Errorf("turn: new server: %w", err)
 	}
-	log.Printf("voice: TURN server listening on %s (public %s, realm %q)",
-		addr, publicIP, cfg.Realm)
+	log.Printf("voice: TURN server up (public %s, realm %q)", publicIP, cfg.Realm)
 	return srv, nil
 }
 
@@ -283,13 +315,14 @@ func (m *voiceManager) peerConnectionConfig() webrtc.Configuration {
 	if host == "" {
 		host = "127.0.0.1"
 	}
+	// Server-side PeerConnection only needs STUN; TURN relay is for
+	// the *client* side and is delivered via the "joined" envelope's
+	// `turn` field (mintTurnCreds).  Including TURN here without
+	// credentials causes pion to reject NewPeerConnection.
+	_ = host
 	return webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
 			{URLs: []string{"stun:stun.l.google.com:19302"}},
-			{
-				URLs: []string{fmt.Sprintf(
-					"turn:%s:%d?transport=udp", host, m.cfg.TurnPort)},
-			},
 		},
 	}
 }
