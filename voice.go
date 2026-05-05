@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"github.com/pion/turn/v3"
+	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -247,8 +248,14 @@ type signalEnvelope struct {
 	SDPMLineIndex *uint16 `json:"mlineidx,omitempty"`
 
 	// state broadcast: "mic" / "video" / "speaking" / "silent" /
-	// "deaf" / "screen"
+	// "deaf" / "screen" / "hand". The envelope Type stays "presence"
+	// when relayed so the recipient dispatches it through applyPresence;
+	// the original semantic ("mic" / "hand" / ...) is carried on Kind.
 	State string `json:"state,omitempty"`
+	Kind  string `json:"kind,omitempty"`
+
+	// Transient emoji reaction visible to everyone in the room.
+	Emoji string `json:"emoji,omitempty"`
 
 	// presence (server->everyone)
 	Members []string `json:"members,omitempty"`
@@ -259,6 +266,34 @@ type signalEnvelope struct {
 
 	// human-readable error
 	Error string `json:"error,omitempty"`
+
+	// SDP chunking. CLIENT_TAG_SIZE_LIMIT in obbyircd is 8191 bytes
+	// post-escape; a video offer/answer routinely exceeds that. The
+	// client splits SDP into N pieces sharing an "id" and a sequential
+	// "seq" with "total"; voice_bridge.go reassembles before dispatch.
+	ChunkID string `json:"id,omitempty"`
+	Seq     *int   `json:"seq,omitempty"`
+	Total   *int   `json:"total,omitempty"`
+
+	// Track-to-nick attribution hint. Pion's emitted SDP doesn't
+	// always include a=msid for added-mid-session tracks (Firefox in
+	// particular falls back to a browser-generated {uuid} stream id),
+	// so the client can't always resolve which member a remote
+	// audio/video/screen track belongs to. We ship an explicit map
+	// alongside the server-pushed "offer".
+	Tracks []TrackHint `json:"tracks,omitempty"`
+}
+
+// TrackHint tells the receiving client which member + kind a given
+// fanned-out track belongs to. trackID matches the value pion sets on
+// the wire (which the browser may or may not honor as track.id);
+// `mid` is the m-line identifier and is preserved across browsers,
+// which makes it the most reliable resolver for attachInboundTrack.
+type TrackHint struct {
+	TrackID string `json:"track_id"`
+	Mid     string `json:"mid,omitempty"`
+	Member  string `json:"member"`
+	Kind    string `json:"kind"`
 }
 
 type voiceRoom struct {
@@ -278,16 +313,21 @@ func (r *voiceRoom) snapshotMembers() []string {
 }
 
 type voicePeer struct {
-	nick     string
-	room     *voiceRoom
-	pc       *webrtc.PeerConnection
-	mu       sync.Mutex
-	// One *TrackLocalStaticRTP per published track.  Other peers
-	// AddTrack() these to receive this peer's media.
-	publishedAudio *webrtc.TrackLocalStaticRTP
-	publishedVideo *webrtc.TrackLocalStaticRTP
-	// Senders we've added to this peer's PC, keyed by other-peer-nick
-	// + kind ("audio"/"video"); used to remove on leave.
+	nick string
+	room *voiceRoom
+	mgr  *voiceManager
+	pc   *webrtc.PeerConnection
+	mu   sync.Mutex
+	// Set whenever a server-side track change couldn't be propagated
+	// because the PC's signaling state wasn't stable. handleClientAnswer
+	// drains it on next stable transition.
+	pendingRenegotiate bool
+	// One *TrackLocalStaticRTP per published track keyed by localID
+	// ("<nick>-<kind>-<remoteTrackID>"). Two video tracks (camera +
+	// screen share) from the same publisher each get their own slot.
+	publishedTracks map[string]*webrtc.TrackLocalStaticRTP
+	// Senders we've added to this peer's PC, keyed by the publisher's
+	// localID; used to remove on leave / cleanup.
 	subSenders map[string]*webrtc.RTPSender
 }
 
@@ -375,6 +415,7 @@ func (m *voiceManager) handleJoin(nick, channel, account string) {
 	peer := &voicePeer{
 		nick:       nick,
 		room:       room,
+		mgr:        m,
 		pc:         pc,
 		subSenders: map[string]*webrtc.RTPSender{},
 	}
@@ -437,6 +478,7 @@ func (m *voiceManager) handleJoin(nick, channel, account string) {
 		Channel: channel,
 		Members: members,
 		TURN:    &turn,
+		Tracks:  peer.trackHints(),
 	})
 
 	// Tell every other peer that someone joined (presence broadcast,
@@ -456,22 +498,13 @@ func (m *voiceManager) handleJoin(nick, channel, account string) {
 func (p *voicePeer) subscribeTo(other *voicePeer) error {
 	other.mu.Lock()
 	defer other.mu.Unlock()
-	if other.publishedAudio != nil {
-		s, err := p.pc.AddTrack(other.publishedAudio)
+	for id, track := range other.publishedTracks {
+		s, err := p.pc.AddTrack(track)
 		if err != nil {
 			return err
 		}
 		p.mu.Lock()
-		p.subSenders[other.nick+"|audio"] = s
-		p.mu.Unlock()
-	}
-	if other.publishedVideo != nil {
-		s, err := p.pc.AddTrack(other.publishedVideo)
-		if err != nil {
-			return err
-		}
-		p.mu.Lock()
-		p.subSenders[other.nick+"|video"] = s
+		p.subSenders[id] = s
 		p.mu.Unlock()
 	}
 	return nil
@@ -483,39 +516,155 @@ func (p *voicePeer) subscribeTo(other *voicePeer) error {
 func (p *voicePeer) fanOutTrack(remote *webrtc.TrackRemote) {
 	kind := remote.Kind().String()
 	codec := remote.Codec()
+	// Use the remote track's id as a uniqueness suffix so a publisher
+	// who fans out multiple tracks of the same kind (e.g. camera +
+	// screen share, both kind="video") doesn't collide on a single
+	// "<nick>-<kind>" identifier. The hint map sent to clients still
+	// keys by track id, so attribution stays correct.
+	//
+	// Strip non-alphanumeric characters from the suffix: Firefox's
+	// getDisplayMedia hands us a "{uuid}" with curly braces and dashes,
+	// and embedding that verbatim in the SDP a=msid line we push to
+	// the viewer trips Firefox into ignoring our msid and substituting
+	// a fresh browser-generated stream id (so attachInboundTrack on
+	// the viewer can't resolve the track to a member, drops it, and
+	// the screen never renders). An ASCII-clean suffix sidesteps all
+	// of that.
+	rawSuffix := remote.ID()
+	clean := make([]byte, 0, len(rawSuffix))
+	for i := 0; i < len(rawSuffix); i++ {
+		c := rawSuffix[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') {
+			clean = append(clean, c)
+		}
+	}
+	if len(clean) == 0 {
+		clean = []byte(fmt.Sprintf("%d", time.Now().UnixNano()))
+	}
+	localID := fmt.Sprintf("%s-%s-%s", p.nick, kind, string(clean))
 	local, err := webrtc.NewTrackLocalStaticRTP(
 		codec.RTPCodecCapability,
-		fmt.Sprintf("%s-%s", p.nick, kind),
+		localID,
 		p.nick,
 	)
 	if err != nil {
 		log.Printf("voice: fanout new track %s: %v", kind, err)
 		return
 	}
+	log.Printf("voice: fanout %s kind=%s local_id=%s remote_id=%s codec=%s",
+		p.nick, kind, localID, remote.ID(), codec.MimeType)
 	p.mu.Lock()
-	if kind == "audio" {
-		p.publishedAudio = local
-	} else if kind == "video" {
-		p.publishedVideo = local
+	if p.publishedTracks == nil {
+		p.publishedTracks = map[string]*webrtc.TrackLocalStaticRTP{}
 	}
+	p.publishedTracks[localID] = local
 	p.mu.Unlock()
 
-	// Subscribe each existing peer to this new track.
+	// Subscribe each existing peer to this new track and re-negotiate
+	// so the client side learns about the new RTPSender. Without the
+	// renegotiate, AddTrack on the server side leaves the client's
+	// view of the PC out of sync and the new audio/video/screen
+	// stream never reaches them.
 	p.room.mu.RLock()
+	others := make([]*voicePeer, 0, len(p.room.peers))
 	for _, other := range p.room.peers {
 		if other.nick == p.nick {
 			continue
 		}
 		s, addErr := other.pc.AddTrack(local)
 		if addErr != nil {
-			log.Printf("voice: AddTrack to %s: %v", other.nick, addErr)
+			log.Printf("voice: AddTrack(%s) -> %s FAILED: %v",
+				localID, other.nick, addErr)
 			continue
 		}
+		log.Printf("voice: AddTrack(%s) -> %s ok", localID, other.nick)
+		// Forward viewer-initiated keyframe requests (PLI/FIR) back
+		// to the publisher. Without this, when a viewer's decoder
+		// resyncs after packet loss it has no way to ask the
+		// upstream encoder for a fresh keyframe; the screen tile
+		// stays gray. RTPSender.Read returns RTCP packets the viewer
+		// emitted for this sender's SSRC.
+		if remote.Kind() == webrtc.RTPCodecTypeVideo {
+			pubPC := p.pc
+			ssrc := uint32(remote.SSRC())
+			go func() {
+				buf := make([]byte, 1500)
+				for {
+					n, _, err := s.Read(buf)
+					if err != nil {
+						return
+					}
+					pkts, err := rtcp.Unmarshal(buf[:n])
+					if err != nil {
+						continue
+					}
+					forwarded := false
+					for _, pkt := range pkts {
+						switch pkt.(type) {
+						case *rtcp.PictureLossIndication,
+							*rtcp.FullIntraRequest:
+							forwarded = true
+						}
+					}
+					if forwarded {
+						_ = pubPC.WriteRTCP([]rtcp.Packet{
+							&rtcp.PictureLossIndication{MediaSSRC: ssrc},
+						})
+					}
+				}
+			}()
+		}
 		other.mu.Lock()
-		other.subSenders[p.nick+"|"+kind] = s
+		// Key by the unique localID so camera+screen (both kind=video)
+		// from the same publisher each get their own slot.
+		other.subSenders[localID] = s
 		other.mu.Unlock()
+		others = append(others, other)
 	}
 	p.room.mu.RUnlock()
+	for _, other := range others {
+		if p.mgr != nil {
+			p.mgr.renegotiateFor(other)
+		}
+	}
+
+	// Periodically nudge the publisher for a fresh keyframe.
+	//
+	// Background: a static screen-share emits no IDR / keyframes for
+	// long stretches because the encoder skips unchanged content. Any
+	// receiver that joins (or recovers from packet loss) is stuck with
+	// no decodable frame -- their <video> tile shows a blank/gray fill
+	// even though our SFU is forwarding the RTP stream. Camera shares
+	// usually self-correct because the encoder's GOP interval triggers
+	// regular keyframes regardless of motion.
+	//
+	// Sending a PictureLossIndication via the upstream RTCP channel
+	// forces pion to forward a keyframe request to the publisher; the
+	// publisher's encoder responds with an IDR and viewers finally
+	// have something to render. We do this only for video tracks, on
+	// a 2-second tick. The goroutine exits when the remote track does.
+	if remote.Kind() == webrtc.RTPCodecTypeVideo {
+		sendPLI := func() error {
+			return p.pc.WriteRTCP([]rtcp.Packet{
+				&rtcp.PictureLossIndication{
+					MediaSSRC: uint32(remote.SSRC()),
+				},
+			})
+		}
+		// Kick an immediate PLI so the first viewer doesn't have to
+		// wait up to one tick interval for a decodable frame.
+		_ = sendPLI()
+		go func() {
+			t := time.NewTicker(2 * time.Second)
+			defer t.Stop()
+			for range t.C {
+				if err := sendPLI(); err != nil {
+					return
+				}
+			}
+		}()
+	}
 
 	// Pump RTP.
 	buf := make([]byte, 1500)
@@ -557,7 +706,10 @@ func (m *voiceManager) handleLeave(nick, channel string) {
 	for _, other := range room.peers {
 		other.mu.Lock()
 		for key, sender := range other.subSenders {
-			if strings.HasPrefix(key, nick+"|") {
+			// subSenders are keyed by the unique localID
+			// "<nick>-<kind>-<remoteTrackID>" -- delete every entry
+			// whose nick segment matches the departing peer.
+			if strings.HasPrefix(key, nick+"-") {
 				_ = other.pc.RemoveTrack(sender)
 				delete(other.subSenders, key)
 			}
@@ -606,7 +758,164 @@ func (m *voiceManager) handleOffer(nick, channel, sdp string) {
 			Error: "set_local: " + err.Error()})
 		return
 	}
-	m.send(nick, signalEnvelope{Type: "answer", SDP: answer.SDP})
+	m.send(nick, signalEnvelope{
+		Type:   "answer",
+		SDP:    answer.SDP,
+		Tracks: peer.trackHints(),
+	})
+
+	// If the peer has more server-side senders than fit in the
+	// answer they just received (e.g. they joined a room where two
+	// other peers already had camera + screen on, but their initial
+	// offer only carried offerToReceiveAudio/Video which yields a
+	// single recvonly slot per kind), pion's answer can only describe
+	// matching m-lines and drops the rest. Push a follow-up server-
+	// initiated offer so the client picks up the orphaned senders.
+	if peer.hasUnnegotiatedSenders() {
+		go func() {
+			// Tiny delay so the client finishes applying our answer
+			// before we slam another offer at it.
+			time.Sleep(50 * time.Millisecond)
+			m.renegotiateFor(peer)
+		}()
+	}
+}
+
+// handleClientAnswer applies an answer the client produced in response
+// to a server-initiated offer (e.g. after we AddTrack'd a new peer's
+// audio/video onto this peer's PC and pushed an offer with renegotiateFor).
+func (m *voiceManager) handleClientAnswer(nick, channel, sdp string) {
+	_, peer := m.lookup(nick, channel)
+	if peer == nil {
+		log.Printf("voice: handleClientAnswer unknown peer %s/%s", nick, channel)
+		return
+	}
+	if err := peer.pc.SetRemoteDescription(webrtc.SessionDescription{
+		Type: webrtc.SDPTypeAnswer, SDP: sdp,
+	}); err != nil {
+		log.Printf("voice: handleClientAnswer set_remote (%s): %v", nick, err)
+		return
+	}
+	log.Printf("voice: handleClientAnswer ok %s sdpLen=%d", nick, len(sdp))
+	// PC is back to stable -- drain any renegotiations that piled up.
+	peer.mu.Lock()
+	pending := peer.pendingRenegotiate
+	peer.pendingRenegotiate = false
+	peer.mu.Unlock()
+	if pending {
+		m.renegotiateFor(peer)
+	}
+}
+
+// renegotiateFor pushes a fresh server-side offer to the given peer.
+// Used whenever we mutate the peer's RTPSender set (e.g. fanOutTrack
+// adds a new sender) so the client's mirrored PC state catches up.
+//
+// If the peer's PC isn't in stable signaling state (i.e. an earlier
+// offer/answer exchange is still in flight), we mark pendingRenegotiate
+// and bail; handleClientAnswer drains the flag once the PC returns to
+// stable. This avoids the "have-local-offer->SetLocal(offer)" pion
+// error when track changes pile up faster than clients can answer.
+func (m *voiceManager) renegotiateFor(peer *voicePeer) {
+	if peer.pc.SignalingState() != webrtc.SignalingStateStable {
+		peer.mu.Lock()
+		peer.pendingRenegotiate = true
+		peer.mu.Unlock()
+		return
+	}
+	offer, err := peer.pc.CreateOffer(nil)
+	if err != nil {
+		log.Printf("voice: renegotiate %s create_offer: %v", peer.nick, err)
+		return
+	}
+	if err := peer.pc.SetLocalDescription(offer); err != nil {
+		log.Printf("voice: renegotiate %s set_local: %v", peer.nick, err)
+		return
+	}
+	hints := peer.trackHints()
+	// Diagnostic: count video m-lines in the offer + log msid lines so
+	// we can tell whether fanOutTrack actually pushed a screen video
+	// transceiver to this peer's PC.
+	mLineCount := 0
+	msidLines := []string{}
+	for _, ln := range strings.Split(offer.SDP, "\r\n") {
+		if strings.HasPrefix(ln, "m=video") {
+			mLineCount++
+		}
+		if strings.HasPrefix(ln, "a=msid:") {
+			msidLines = append(msidLines, ln)
+		}
+	}
+	log.Printf("voice: renegotiate %s videoMLines=%d hints=%d msids=%v",
+		peer.nick, mLineCount, len(hints), msidLines)
+	m.send(peer.nick, signalEnvelope{
+		Type:   "offer",
+		SDP:    offer.SDP,
+		Tracks: hints,
+	})
+}
+
+// hasUnnegotiatedSenders reports whether the peer's PC has any
+// outgoing track whose transceiver hasn't been included in a
+// completed offer/answer yet -- pion leaves Mid() empty until the
+// transceiver appears in an applied SDP. After the initial join
+// handshake we use this to decide whether to push a follow-up offer
+// so late joiners pick up senders that didn't fit in the first
+// recvonly slot of their original offer.
+func (p *voicePeer) hasUnnegotiatedSenders() bool {
+	for _, t := range p.pc.GetTransceivers() {
+		s := t.Sender()
+		if s == nil {
+			continue
+		}
+		if s.Track() == nil {
+			continue
+		}
+		if t.Mid() == "" {
+			return true
+		}
+	}
+	return false
+}
+
+// trackHints reports which fanned-out tracks are currently subscribed
+// to this peer's PC. The client uses these as a side-channel to map
+// inbound RTPReceiver tracks to publisher nicks even when the browser
+// fails to honor pion's a=msid (Firefox in particular substitutes a
+// random {uuid} for tracks added mid-session).
+func (p *voicePeer) trackHints() []TrackHint {
+	// Walk transceivers (not the subSenders map) so we can capture the
+	// transceiver's Mid() -- Firefox preserves Mid on the receiving
+	// side even when it discards or rewrites msid/track-id.
+	out := []TrackHint{}
+	for _, t := range p.pc.GetTransceivers() {
+		s := t.Sender()
+		if s == nil {
+			continue
+		}
+		track := s.Track()
+		if track == nil {
+			continue
+		}
+		// localID format: "<nick>-<kind>-<asciiSuffix>".
+		id := track.ID()
+		first := strings.IndexByte(id, '-')
+		if first < 0 {
+			continue
+		}
+		rest := id[first+1:]
+		second := strings.IndexByte(rest, '-')
+		if second < 0 {
+			continue
+		}
+		out = append(out, TrackHint{
+			TrackID: id,
+			Mid:     t.Mid(),
+			Member:  id[:first],
+			Kind:    rest[:second],
+		})
+	}
+	return out
 }
 
 func (m *voiceManager) handleICE(nick, channel string, env signalEnvelope) {
@@ -625,9 +934,33 @@ func (m *voiceManager) handleICE(nick, channel string, env signalEnvelope) {
 	_ = peer.pc.AddICECandidate(cand)
 }
 
+// handleReaction broadcasts a transient emoji to the room. Reactions
+// don't accumulate state; the receiving clients animate them and
+// forget. We rebroadcast under type="react" (rather than presence)
+// so the client can route them through onReaction without colliding
+// with persistent presence state.
+func (m *voiceManager) handleReaction(nick, channel string, env signalEnvelope) {
+	if env.Emoji == "" {
+		return
+	}
+	_, peer := m.lookup(nick, channel)
+	if peer == nil {
+		return
+	}
+	m.broadcast(channel, nick, signalEnvelope{
+		Type:    "react",
+		Member:  nick,
+		Emoji:   env.Emoji,
+		Channel: channel,
+	})
+}
+
 func (m *voiceManager) handleState(nick, channel string, env signalEnvelope) {
-	// State (mute/cam/speaking/etc) is presence -- just rebroadcast
-	// to everyone in the room.
+	// State (mute/cam/speaking/hand/etc) is presence -- rebroadcast
+	// to everyone in the room. We forward env.Type as Kind so the
+	// recipient can tell which specific state changed (mic vs video
+	// vs hand etc.); the envelope Type itself stays "presence" so
+	// onSignal dispatches to applyPresence on the client.
 	_, peer := m.lookup(nick, channel)
 	if peer == nil {
 		return
@@ -636,6 +969,7 @@ func (m *voiceManager) handleState(nick, channel string, env signalEnvelope) {
 		Type:    "presence",
 		Member:  nick,
 		State:   env.State,
+		Kind:    env.Type,
 		Channel: channel,
 	})
 }

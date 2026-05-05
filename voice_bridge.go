@@ -35,6 +35,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -65,10 +66,69 @@ type voiceBridge struct {
 	// a reconnect on an old conn pointer become no-ops via the epoch
 	// check.
 	connEpoch atomic.Uint64
+
+	// Reassembly buffers for chunked SDP signals (offer / answer).
+	// Keyed by sender-nick + chunk-id; entries are dropped on
+	// completion or reset on bridge reconnect.
+	chunkMu  sync.Mutex
+	chunkBuf map[string]*sdpChunkBuf
+}
+
+type sdpChunkBuf struct {
+	parts    []string
+	received int
+	template signalEnvelope // metadata copied from chunk #0
 }
 
 func newVoiceBridge(cfg VoiceConfig, mgr *voiceManager) *voiceBridge {
-	return &voiceBridge{cfg: cfg, mgr: mgr}
+	return &voiceBridge{
+		cfg:      cfg,
+		mgr:      mgr,
+		chunkBuf: map[string]*sdpChunkBuf{},
+	}
+}
+
+// assembleChunk collects a chunked SDP envelope. Returns a non-nil
+// envelope (with the full SDP and chunk metadata stripped) once all
+// pieces have arrived; returns nil while still waiting for more.
+func (b *voiceBridge) assembleChunk(from string, env signalEnvelope) *signalEnvelope {
+	if env.ChunkID == "" || env.Total == nil || env.Seq == nil || *env.Total <= 0 {
+		// Not chunked. Return as-is.
+		copy := env
+		return &copy
+	}
+	key := from + "\x00" + env.ChunkID
+	b.chunkMu.Lock()
+	defer b.chunkMu.Unlock()
+	buf := b.chunkBuf[key]
+	if buf == nil {
+		buf = &sdpChunkBuf{
+			parts:    make([]string, *env.Total),
+			template: env,
+		}
+		b.chunkBuf[key] = buf
+	}
+	if *env.Seq < 0 || *env.Seq >= len(buf.parts) {
+		log.Printf("voice: chunk seq %d out of range (total=%d)", *env.Seq, len(buf.parts))
+		delete(b.chunkBuf, key)
+		return nil
+	}
+	if buf.parts[*env.Seq] != "" {
+		// Duplicate chunk -- ignore.
+		return nil
+	}
+	buf.parts[*env.Seq] = env.SDP
+	buf.received++
+	if buf.received < len(buf.parts) {
+		return nil
+	}
+	delete(b.chunkBuf, key)
+	full := buf.template
+	full.SDP = strings.Join(buf.parts, "")
+	full.ChunkID = ""
+	full.Seq = nil
+	full.Total = nil
+	return &full
 }
 
 func (b *voiceBridge) listenAndServe(ctx context.Context) error {
@@ -136,11 +196,21 @@ func (b *voiceBridge) handleConn(c net.Conn) {
 func (b *voiceBridge) dispatch(f bridgeFrame) {
 	switch f.Op {
 	case "signal":
-		var env signalEnvelope
-		if err := json.Unmarshal(f.Payload, &env); err != nil {
+		var raw signalEnvelope
+		if err := json.Unmarshal(f.Payload, &raw); err != nil {
 			log.Printf("voice: signal payload: %v", err)
 			return
 		}
+		// Reassemble chunked SDP signals (offer / answer split by the
+		// client to fit under CLIENT_TAG_SIZE_LIMIT). Non-chunked
+		// envelopes return immediately as-is.
+		envPtr := b.assembleChunk(f.From, raw)
+		if envPtr == nil {
+			return
+		}
+		env := *envPtr
+		log.Printf("voice: signal type=%q from=%s ch=%s sdpLen=%d candLen=%d",
+			env.Type, f.From, f.Channel, len(env.SDP), len(env.Candidate))
 		switch env.Type {
 		case "join":
 			b.mgr.handleJoin(f.From, env.Channel, f.Account)
@@ -148,10 +218,14 @@ func (b *voiceBridge) dispatch(f bridgeFrame) {
 			b.mgr.handleLeave(f.From, env.Channel)
 		case "offer":
 			b.mgr.handleOffer(f.From, f.Channel, env.SDP)
+		case "answer":
+			b.mgr.handleClientAnswer(f.From, f.Channel, env.SDP)
 		case "ice":
 			b.mgr.handleICE(f.From, f.Channel, env)
-		case "mic", "video", "speaking", "silent", "deaf", "screen":
+		case "mic", "video", "speaking", "silent", "deaf", "screen", "hand":
 			b.mgr.handleState(f.From, f.Channel, env)
+		case "react":
+			b.mgr.handleReaction(f.From, f.Channel, env)
 		default:
 			log.Printf("voice: unknown signal type %q", env.Type)
 		}
