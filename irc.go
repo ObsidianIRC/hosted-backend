@@ -2,14 +2,22 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
+	"strings"
+	"sync"
 
 	unrealircd "github.com/ObsidianIRC/unrealircd-rpc-golang"
 )
 
 // Global var for connection
 var ircConn *unrealircd.Connection
+
+// ircMu guards re-creating ircConn during a reconnect.  The
+// underlying Query() already serialises its own writes, but we need
+// our own lock to keep two callers from racing on the pointer swap.
+var ircMu sync.Mutex
 
 // InitIRCConn initializes the IRC connection
 func InitIRCConn() error {
@@ -35,6 +43,60 @@ func InitIRCConn() error {
 	}
 	ircConn = conn
 	return nil
+}
+
+// ircQuery runs a JSON-RPC method against ircConn and transparently
+// reconnects once if the underlying websocket has been torn down
+// (most commonly because the IRCd restarted or rehashed and dropped
+// idle peers). The RPC library has no built-in retry, so a stale
+// pointer will otherwise fail every subsequent call with "broken
+// pipe" / "use of closed network connection".
+func ircQuery(method string, params map[string]interface{}) (interface{}, error) {
+	ircMu.Lock()
+	defer ircMu.Unlock()
+
+	if ircConn == nil {
+		if err := InitIRCConn(); err != nil {
+			return nil, fmt.Errorf("ircd RPC unavailable: %w", err)
+		}
+	}
+
+	raw, err := ircConn.Query(method, params, false)
+	if err == nil {
+		return raw, nil
+	}
+	if !isIRCConnError(err) {
+		return nil, err
+	}
+
+	// Connection looks dead — reconnect and retry once.  If the
+	// reconnect itself fails we surface the original error
+	// alongside, otherwise callers get a misleading "connection
+	// refused" when the real problem was something else.
+	if rerr := InitIRCConn(); rerr != nil {
+		return nil, fmt.Errorf("ircd RPC reconnect failed: %w (original error: %v)", rerr, err)
+	}
+	return ircConn.Query(method, params, false)
+}
+
+func isIRCConnError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	for _, marker := range []string{
+		"broken pipe",
+		"use of closed network connection",
+		"connection reset",
+		"websocket: close",
+		"EOF",
+		"i/o timeout",
+	} {
+		if strings.Contains(s, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // IRC handlers
