@@ -1,0 +1,15 @@
+.git
+.github
+.vscode
+.idea
+.claude
+*.md
+LICENSE
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+backend
+hosted-backend
+.env
+.env.local
