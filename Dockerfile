@@ -15,7 +15,7 @@ COPY . .
 RUN CGO_ENABLED=1 go build -trimpath -ldflags="-s -w" -o /out/backend .
 
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates sqlite-libs tzdata wget \
+RUN apk add --no-cache ca-certificates sqlite-libs tzdata netcat-openbsd \
     && adduser -D -u 1000 backend \
     && mkdir -p /app/data /app/images /run/obbyirc \
     && chown -R backend:backend /app /run/obbyirc
@@ -24,5 +24,5 @@ COPY --from=builder /out/backend /usr/local/bin/backend
 USER backend
 EXPOSE 8080 3478/udp
 HEALTHCHECK --interval=10s --timeout=3s --start-period=15s --retries=3 \
-    CMD wget -qO- http://127.0.0.1:8080/health >/dev/null 2>&1 || exit 1
+    CMD nc -z 127.0.0.1 8080 || exit 1
 CMD ["backend"]
