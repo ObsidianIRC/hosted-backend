@@ -226,6 +226,10 @@ func (b *voiceBridge) dispatch(f bridgeFrame) {
 			b.mgr.handleState(f.From, f.Channel, env)
 		case "react":
 			b.mgr.handleReaction(f.From, f.Channel, env)
+		case "promote":
+			b.mgr.handlePromote(f.From, f.Channel, env)
+		case "demote":
+			b.mgr.handleDemote(f.From, f.Channel, env)
 		default:
 			log.Printf("voice: unknown signal type %q", env.Type)
 		}

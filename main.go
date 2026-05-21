@@ -222,10 +222,20 @@ func main() {
 
 	r := mux.NewRouter()
 
-	// File upload (requires JWT)
-	r.HandleFunc("/upload", AuthMiddleware(func(w http.ResponseWriter, r *http.Request) {
+	// OAuth2 token-endpoint CORS proxy. Browsers can't POST directly to
+	// GitHub's /login/oauth/access_token (no Allow-Origin header). The
+	// SPA hits POST /oauth/exchange/<provider> here and we relay to the
+	// upstream URL configured via OAUTH_PROXY_<PROVIDER> in .env.
+	r.HandleFunc("/oauth/exchange/{provider}", handleOAuthExchange).
+		Methods("POST", "OPTIONS")
+
+	// File upload (requires a draft/authtoken bearer minted by
+	// obbyircd's `TOKEN GENERATE filehost`).  AuthTokenMiddleware
+	// burns the token on validate -- one upload per token, matching
+	// the spec's single-use semantic.
+	r.HandleFunc("/upload", AuthTokenMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		uploadHandler(w, r, port, deleteTimeout, mediaCfg, imageCompressionEnabled, imageMaxWidth, imageMaxHeight, imageJpegQuality, imageConvertToJpeg)
-	}, false)).Methods("POST", "OPTIONS")
+	})).Methods("POST", "OPTIONS")
 
 	// Public upload-policy discovery so clients can pre-validate
 	// before pushing bytes.  No auth required: the policy is the
@@ -246,19 +256,22 @@ func main() {
 		})
 	}).Methods("GET", "OPTIONS")
 
-	// Avatar uploads (require JWT)
-	r.HandleFunc("/upload/avatar/user", AuthMiddleware(func(w http.ResponseWriter, r *http.Request) {
+	// Avatar uploads — same draft/authtoken flow as /upload.
+	r.HandleFunc("/upload/avatar/user", AuthTokenMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		uploadUserAvatarHandler(w, r, maxUploadSize, imageCompressionEnabled, imageMaxWidth, imageMaxHeight, imageJpegQuality, imageConvertToJpeg)
-	}, false)).Methods("POST", "OPTIONS")
+	})).Methods("POST", "OPTIONS")
 
-	r.HandleFunc("/upload/avatar/channel/{channel}", AuthMiddleware(func(w http.ResponseWriter, r *http.Request) {
+	r.HandleFunc("/upload/avatar/channel/{channel}", AuthTokenMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		uploadChannelAvatarHandler(w, r, maxUploadSize, imageCompressionEnabled, imageMaxWidth, imageMaxHeight, imageJpegQuality, imageConvertToJpeg)
-	}, false)).Methods("POST", "OPTIONS")
+	})).Methods("POST", "OPTIONS")
 
 	// Image serving (kept for back-compat with old links)
 	r.PathPrefix("/images/").Handler(corsHandler(http.StripPrefix("/images/", http.FileServer(http.Dir("images")))))
 	// Generic media serving (videos, audio, and new image uploads)
 	r.PathPrefix("/uploads/").Handler(corsHandler(http.StripPrefix("/uploads/", http.FileServer(http.Dir(uploadsDir)))))
+
+	// draft/custom-emoji: public pack JSON + admin CRUD (oper-only).
+	registerEmojiRoutes(r)
 
 	// IRC info endpoints (require JWT + IRCop)
 	r.HandleFunc("/irc/users", AuthMiddleware(handleIRCUsers, true)).Methods("GET")
