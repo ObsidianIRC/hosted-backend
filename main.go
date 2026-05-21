@@ -203,6 +203,13 @@ func main() {
 		// Continue without IRC features
 	}
 
+	// Web Push (soju.im/webpush): load/generate the VAPID keypair so
+	// /push/vapid-key and /push/send can serve obbyircd.
+	if err := InitWebPush(); err != nil {
+		fmt.Printf("Failed to initialize web push: %v\n", err)
+		// Continue without push features
+	}
+
 	// Voice subsystem: embedded TURN + WebRTC SFU + Unix-socket
 	// bridge for obbyircd's voice-channels module.  No-ops with a
 	// log line if VOICE_TURN_SECRET is unset.
@@ -278,6 +285,15 @@ func main() {
 	channelRouter.HandleFunc("/{id}", handleUpdateChannel).Methods("PUT")
 	channelRouter.HandleFunc("/{id}/metadata", handleSetChannelMetadata).Methods("POST")
 	channelRouter.HandleFunc("/{id}/permissions", handleSetChannelPermissions).Methods("POST")
+
+	// Web Push: VAPID public key is non-secret (clients embed it, obbyircd
+	// advertises it in ISUPPORT), so the key endpoint is unauthenticated.
+	r.HandleFunc("/push/vapid-key", handleVapidKey).Methods("GET", "OPTIONS")
+	// The send endpoint is obbyircd-only -- guarded by the shared
+	// X-ObsidianIRC-Key (same secret the /irc/* server routes use).
+	pushRouter := r.PathPrefix("/push").Subrouter()
+	pushRouter.Use(ServerAuthMiddleware)
+	pushRouter.HandleFunc("/send", handlePushSend).Methods("POST")
 
 	// pprof on loopback only -- useful for diagnosing runaway memory
 	// without exposing it externally.  curl 127.0.0.1:6060/debug/pprof/heap
