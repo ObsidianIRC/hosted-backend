@@ -32,8 +32,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pion/turn/v3"
 	"github.com/pion/rtcp"
+	"github.com/pion/turn/v3"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -60,6 +60,10 @@ type VoiceConfig struct {
 	MaxRoomSize int
 	// ICE/TURN realm for the embedded TURN server.
 	Realm string
+	// When true, skip starting the embedded TURN listener.  The SFU
+	// still runs; clients are expected to receive TURN credentials
+	// from an external source (e.g. the IRCd's voice::turn rewrite).
+	DisableEmbeddedTurn bool
 }
 
 func loadVoiceConfig() VoiceConfig {
@@ -87,6 +91,9 @@ func loadVoiceConfig() VoiceConfig {
 			cfg.MaxRoomSize = p
 		}
 	}
+	if b, err := strconv.ParseBool(strings.TrimSpace(os.Getenv("VOICE_TURN_DISABLE_EMBEDDED"))); err == nil {
+		cfg.DisableEmbeddedTurn = b
+	}
 	return cfg
 }
 
@@ -103,10 +110,10 @@ func loadVoiceConfig() VoiceConfig {
 // The TURN server uses the same secret to validate the password,
 // rejecting anything past the expiry.
 type TurnCreds struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
+	Username string   `json:"username"`
+	Password string   `json:"password"`
 	URLs     []string `json:"urls"`
-	TTL      int64  `json:"ttl"`
+	TTL      int64    `json:"ttl"`
 }
 
 func mintTurnCreds(cfg VoiceConfig, account string, ttl time.Duration) TurnCreds {
@@ -243,8 +250,8 @@ type signalEnvelope struct {
 	SDP string `json:"sdp,omitempty"`
 
 	// "ice"
-	Candidate     string `json:"cand,omitempty"`
-	SDPMid        string `json:"mid,omitempty"`
+	Candidate     string  `json:"cand,omitempty"`
+	SDPMid        string  `json:"mid,omitempty"`
 	SDPMLineIndex *uint16 `json:"mlineidx,omitempty"`
 
 	// state broadcast: "mic" / "video" / "speaking" / "silent" /

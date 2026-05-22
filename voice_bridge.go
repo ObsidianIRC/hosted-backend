@@ -39,6 +39,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/pion/turn/v3"
 )
 
 type bridgeFrame struct {
@@ -297,10 +299,16 @@ func startVoiceSubsystem(ctx context.Context) func() {
 		return func() {}
 	}
 
-	turnSrv, err := startTurnServer(cfg)
-	if err != nil {
-		log.Printf("voice: TURN startup: %v", err)
-		return func() {}
+	var turnSrv *turn.Server
+	if cfg.DisableEmbeddedTurn {
+		log.Printf("voice: VOICE_TURN_DISABLE_EMBEDDED set; not starting embedded TURN")
+	} else {
+		s, err := startTurnServer(cfg)
+		if err != nil {
+			log.Printf("voice: TURN startup: %v", err)
+			return func() {}
+		}
+		turnSrv = s
 	}
 
 	mgr := newVoiceManager(cfg)
@@ -312,6 +320,9 @@ func startVoiceSubsystem(ctx context.Context) func() {
 	}()
 
 	return func() {
+		if turnSrv == nil {
+			return
+		}
 		shutdownCtx, cancel := context.WithTimeout(
 			context.Background(), 5*time.Second)
 		defer cancel()
