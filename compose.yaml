@@ -51,7 +51,7 @@ services:
       - traefik.http.services.api.loadbalancer.server.port=8080
 
   obbyircd:
-    image: ${OBBYIRCD_IMAGE:-mattfly/obbyircd:latest}
+    image: ${OBBYIRCD_IMAGE:-obbyirc/obbyircd:latest}
     container_name: obbyircd
     restart: unless-stopped
     expose:
@@ -85,7 +85,7 @@ services:
       - traefik.http.services.obbyircd.loadbalancer.server.port=8080
 
   obby:
-    image: ${OBBY_WEB_IMAGE:-mattfly/obby:latest}
+    image: ${OBBY_WEB_IMAGE:-obbyirc/obby:latest}
     container_name: obby-web
     restart: unless-stopped
     profiles: ["frontend"]
