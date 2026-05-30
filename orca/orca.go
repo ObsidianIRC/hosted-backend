@@ -17,6 +17,7 @@ type Orca struct {
 	token    string
 	channels []string
 
+	irc  IRC
 	chat ai.ChatProvider
 	tts  ai.TTSProvider
 	stt  ai.STTProvider
@@ -28,7 +29,7 @@ type Orca struct {
 
 type Handler func(ctx context.Context, inv *bot.Invocation) error
 
-func New() *Orca {
+func New(irc IRC) *Orca {
 	nick := envOr("ORCA_NICK", "Orca")
 	token := os.Getenv("ORCA_PUSHBOT_TOKEN")
 	channels := splitCSV(envOr("ORCA_CHANNELS", "#opers"))
@@ -37,6 +38,7 @@ func New() *Orca {
 		nick:     nick,
 		token:    token,
 		channels: channels,
+		irc:      irc,
 		chat:     ai.ChatFromEnv(),
 		tts:      ai.TTSFromEnv(),
 		stt:      ai.STTFromEnv(),
@@ -67,7 +69,10 @@ func (o *Orca) registerCommand(c bot.Command, h Handler) {
 }
 
 func (o *Orca) registerCommands() {
-	// Filled in by phase 3 (text commands) and phase 4 (/ask).
+	o.registerCommand(auditCommand, o.cmdAudit)
+	o.registerCommand(scanCommand, o.cmdScan)
+	o.registerCommand(explainCommand, o.cmdExplain)
+	o.registerCommand(synthBanCommand, o.cmdSynthBan)
 }
 
 func (o *Orca) OnInvoke(ctx context.Context, inv *bot.Invocation) error {
@@ -94,9 +99,9 @@ func (o *Orca) OnEvent(ctx context.Context, eventName string, data json.RawMessa
 
 // Start registers Orca with the registry and starts gateway connections.
 // Call once at backend startup.
-func Start(ctx context.Context) (*bot.Registry, error) {
+func Start(ctx context.Context, irc IRC) (*bot.Registry, error) {
 	reg := bot.NewRegistry()
-	o := New()
+	o := New(irc)
 	if o.token == "" {
 		log.Printf("[orca] ORCA_PUSHBOT_TOKEN unset; Orca disabled")
 		return reg, nil
