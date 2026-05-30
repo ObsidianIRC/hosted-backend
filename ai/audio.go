@@ -22,29 +22,52 @@ type OpenAIAudio struct {
 	Client  *http.Client
 }
 
-func TTSFromEnv() *OpenAIAudio {
+// TTSFromEnv constructs a TTS provider from env. AI_TTS_PROVIDER selects
+// the shape explicitly ("openai" or "pollinations"); if unset, we sniff
+// AI_TTS_BASE_URL to auto-pick (pollinations.ai → pollinations GET, else
+// OpenAI POST). Defaults to Pollinations because that's the user's
+// configured endpoint and OpenAI-compatible TTS isn't exposed there.
+func TTSFromEnv() TTSProvider {
 	key := os.Getenv("AI_TTS_API_KEY")
 	if key == "" {
 		key = os.Getenv("AI_API_KEY")
 	}
+	provider := strings.ToLower(os.Getenv("AI_TTS_PROVIDER"))
 	base := os.Getenv("AI_TTS_BASE_URL")
-	if base == "" {
-		base = "https://gen.pollinations.ai/v1"
-	}
 	model := os.Getenv("AI_TTS_MODEL")
-	if model == "" {
-		model = "openai-audio"
-	}
 	voice := os.Getenv("AI_TTS_VOICE")
-	if voice == "" {
-		voice = "alloy"
+
+	if provider == "" {
+		if base == "" || strings.Contains(base, "pollinations.ai") {
+			provider = "pollinations"
+		} else {
+			provider = "openai"
+		}
 	}
-	return &OpenAIAudio{
-		BaseURL: strings.TrimRight(base, "/"),
-		Model:   model,
-		Voice:   voice,
-		APIKey:  key,
-		Client:  &http.Client{Timeout: 60 * time.Second},
+
+	switch provider {
+	case "pollinations":
+		if base == "" {
+			base = "https://gen.pollinations.ai"
+		}
+		return NewPollinationsAudio(base, model, voice, key)
+	default:
+		if base == "" {
+			base = "https://api.openai.com/v1"
+		}
+		if model == "" {
+			model = "tts-1"
+		}
+		if voice == "" {
+			voice = "alloy"
+		}
+		return &OpenAIAudio{
+			BaseURL: strings.TrimRight(base, "/"),
+			Model:   model,
+			Voice:   voice,
+			APIKey:  key,
+			Client:  &http.Client{Timeout: 60 * time.Second},
+		}
 	}
 }
 

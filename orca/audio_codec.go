@@ -130,6 +130,59 @@ func DepacketizeOpus(rtpBytes []byte) (payload []byte, ssrc uint32, err error) {
 	return pkt.Payload, pkt.SSRC, nil
 }
 
+// DecodeWAV parses a RIFF/WAVE container with 16-bit PCM samples and
+// returns the interleaved int16 PCM plus sample rate and channel count.
+// Pollinations TTS returns audio/wav at 16-bit mono 24 kHz; this stays
+// permissive about chunk ordering (skips unknown sub-chunks) so future
+// providers don't need a new decoder.
+func DecodeWAV(data []byte) (pcm []int16, sampleRate int, channels int, err error) {
+	if len(data) < 44 {
+		return nil, 0, 0, fmt.Errorf("wav too short (%d bytes)", len(data))
+	}
+	if string(data[0:4]) != "RIFF" || string(data[8:12]) != "WAVE" {
+		return nil, 0, 0, fmt.Errorf("wav: missing RIFF/WAVE header")
+	}
+	var fmtChunk []byte
+	var dataChunk []byte
+	off := 12
+	for off+8 <= len(data) {
+		id := string(data[off : off+4])
+		sz := int(binary.LittleEndian.Uint32(data[off+4 : off+8]))
+		body := data[off+8 : off+8+sz]
+		switch id {
+		case "fmt ":
+			fmtChunk = body
+		case "data":
+			dataChunk = body
+		}
+		off += 8 + sz
+		if sz%2 == 1 {
+			off++
+		}
+	}
+	if fmtChunk == nil || dataChunk == nil {
+		return nil, 0, 0, fmt.Errorf("wav: missing fmt or data chunk")
+	}
+	if len(fmtChunk) < 16 {
+		return nil, 0, 0, fmt.Errorf("wav: short fmt chunk (%d)", len(fmtChunk))
+	}
+	format := binary.LittleEndian.Uint16(fmtChunk[0:2])
+	channels = int(binary.LittleEndian.Uint16(fmtChunk[2:4]))
+	sampleRate = int(binary.LittleEndian.Uint32(fmtChunk[4:8]))
+	bits := binary.LittleEndian.Uint16(fmtChunk[14:16])
+	if format != 1 {
+		return nil, 0, 0, fmt.Errorf("wav: only PCM (format=1) supported, got %d", format)
+	}
+	if bits != 16 {
+		return nil, 0, 0, fmt.Errorf("wav: only 16-bit PCM supported, got %d", bits)
+	}
+	pcm = make([]int16, len(dataChunk)/2)
+	for i := range pcm {
+		pcm[i] = int16(binary.LittleEndian.Uint16(dataChunk[i*2:]))
+	}
+	return pcm, sampleRate, channels, nil
+}
+
 // DecodeMP3 fully decodes an MP3 byte stream to interleaved 16-bit PCM.
 // hajimehoshi/go-mp3 always outputs 44.1 kHz / 48 kHz stereo (depending
 // on source), so the caller may need to resample / mono-mix.  The

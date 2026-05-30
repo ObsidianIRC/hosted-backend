@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 )
@@ -110,7 +111,7 @@ func (t *localTap) Speak(ctx context.Context, channel string, audio []byte, mime
 	if peer == nil {
 		return fmt.Errorf("not joined to %s", channel)
 	}
-	return speakOpus(peer, audio)
+	return speakOpus(peer, audio, mime)
 }
 
 // silenceRMS is the squared-amplitude threshold that marks a frame as
@@ -236,15 +237,31 @@ func int16ToBytes(samples []int16) []byte {
 // get decoded to PCM, resampled to 48 kHz stereo, encoded to Opus in
 // 20 ms frames, RTP-wrapped, and written to the LocalPeer's outbound
 // track at real-time pacing.
-func speakOpus(peer LocalPeer, audio []byte) error {
-	pcm, srcRate, err := DecodeMP3(audio)
-	if err != nil {
-		return fmt.Errorf("mp3 decode: %w", err)
+func speakOpus(peer LocalPeer, audio []byte, mime string) error {
+	var pcm []int16
+	var srcRate, srcChannels int
+	mime = strings.ToLower(mime)
+	switch {
+	case strings.Contains(mime, "wav") || strings.Contains(mime, "wave"):
+		p, rate, ch, err := DecodeWAV(audio)
+		if err != nil {
+			return fmt.Errorf("wav decode: %w", err)
+		}
+		pcm, srcRate, srcChannels = p, rate, ch
+	default:
+		p, rate, err := DecodeMP3(audio)
+		if err != nil {
+			return fmt.Errorf("mp3 decode: %w", err)
+		}
+		// go-mp3 yields 16-bit stereo PCM.
+		pcm, srcRate, srcChannels = p, rate, 2
 	}
-	// go-mp3 yields 16-bit stereo PCM. Resample if the rate isn't
-	// already Opus's 48 kHz expectation.
+	if srcChannels == 1 {
+		pcm = MonoToStereo(pcm)
+		srcChannels = 2
+	}
 	if srcRate != opusSampleRate {
-		pcm = Resample(pcm, srcRate, opusSampleRate, 2)
+		pcm = Resample(pcm, srcRate, opusSampleRate, srcChannels)
 	}
 
 	enc, err := NewOpusEncoder()
