@@ -31,7 +31,15 @@ func newWorkflowEmitter(gw *Gateway, target, triggerMsgid, name string) *Workflo
 func (w *WorkflowEmitter) ID() string     { return w.id }
 func (w *WorkflowEmitter) Target() string { return w.target }
 
+// emit is nil-safe so callers that don't have a real workflow context
+// (e.g. Orca's voice path invoking admin tools without a user-facing
+// invocation) can pass a nil *WorkflowEmitter and get silent no-ops
+// rather than panics. The public methods below propagate this by
+// short-circuiting on a nil receiver.
 func (w *WorkflowEmitter) emit(payload map[string]any) error {
+	if w == nil {
+		return nil
+	}
 	b, err := json.Marshal(payload)
 	if err != nil {
 		return err
@@ -58,6 +66,9 @@ func (w *WorkflowEmitter) Start(features ...string) error {
 }
 
 func (w *WorkflowEmitter) WorkflowState(state string) error {
+	if w == nil {
+		return nil
+	}
 	if state == "complete" || state == "failed" || state == "cancelled" {
 		w.terminated.Store(true)
 	}
@@ -105,6 +116,9 @@ func (w *WorkflowEmitter) Reasoning(text string) error {
 }
 
 func (w *WorkflowEmitter) StartToolCall(tool, label string, params any) *Step {
+	if w == nil {
+		return nil
+	}
 	sid := w.nextSid()
 	st := &Step{w: w, sid: sid, stype: "tool-call", tool: tool, label: label}
 	payload := map[string]any{
@@ -126,6 +140,9 @@ func (w *WorkflowEmitter) StartToolCall(tool, label string, params any) *Step {
 }
 
 func (s *Step) Result(summary string) error {
+	if s == nil {
+		return nil
+	}
 	resultSid := s.w.nextSid()
 	if err := s.w.emit(map[string]any{
 		"msg":     "step",
@@ -149,6 +166,9 @@ func (s *Step) Result(summary string) error {
 }
 
 func (s *Step) Failed(reason string) error {
+	if s == nil {
+		return nil
+	}
 	if reason != "" {
 		_ = s.w.emit(map[string]any{
 			"msg":     "step",

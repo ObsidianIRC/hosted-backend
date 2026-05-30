@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -189,17 +190,17 @@ func (vs *voiceSubsystem) handleUtterance(ctx context.Context, channel, speaker 
 		return
 	}
 
-	mirror := vs.cfg.MirrorChannel
-	if mirror != "" {
-		// Best-effort transcript mirror via direct PRIVMSG using the
-		// existing public-reply path. We don't have a clean handle on
-		// "send arbitrary PRIVMSG" outside of an Invocation, so the
-		// mirror is logged for now -- the SFU integration will likely
-		// also surface a "broadcast to channel" hook to use here.
-		log.Printf("[orca/voice] %s/%s (would mirror to %s): %q",
-			channel, speaker, mirror, transcript)
-	} else {
-		log.Printf("[orca/voice] %s/%s: %q", channel, speaker, transcript)
+	// Mirror the transcript into the voice channel itself as a PRIVMSG
+	// from Orca's ghost ("<speaker> their utterance"), so the text-side
+	// users see what was said in the call. Voice channels (^) accept
+	// PRIVMSGs, and the bot's pushbot gateway exposes a SendMessage
+	// op for spontaneous channel sends (no invocation context needed).
+	log.Printf("[orca/voice] %s/%s: %q", channel, speaker, transcript)
+	if gw := vs.o.Gateway(); gw != nil {
+		mirrorMsg := fmt.Sprintf("<%s> %s", speaker, transcript)
+		if err := gw.SendMessage(channel, mirrorMsg, false); err != nil {
+			log.Printf("[orca/voice] %s: mirror PRIVMSG: %v", channel, err)
+		}
 	}
 
 	matched, query := vs.wake.match(transcript)
@@ -227,15 +228,23 @@ func (vs *voiceSubsystem) handleUtterance(ctx context.Context, channel, speaker 
 		log.Printf("[orca/voice] %s: tts: %v", channel, terr)
 		return
 	}
+	log.Printf("[orca/voice] %s: tts ok mime=%s bytes=%d head=%q",
+		channel, mime, len(audio), truncate(string(audio), 64))
 	if serr := vs.tap.Speak(ctx, channel, audio, mime); serr != nil {
 		log.Printf("[orca/voice] %s: speak: %v", channel, serr)
 	}
 }
 
-// askPlain runs a tool-less /ask-shaped exchange so voice replies stay short
-// and don't drag the full admin tool budget into every utterance. Memory is
-// still kept per voice channel via the same ConvKey, so a follow-up question
-// in voice resolves the context of the previous one.
+// voiceToolBudget caps how many tool round-trips a single spoken
+// question can drive. Lower than /ask because voice round-trip latency
+// is felt much more sharply -- 1-2 tool calls is usually plenty to
+// resolve "who's in #X?" / "what channels exist?" style asks.
+const voiceToolBudget = 3
+
+// askPlain runs an /ask-shaped exchange with the same admin-tool access
+// /ask has, but with a smaller iteration budget so voice latency stays
+// reasonable. Memory is kept per voice channel via the same ConvKey,
+// so a follow-up question in voice resolves the context of the previous one.
 func (vs *voiceSubsystem) askPlain(ctx context.Context, channel, speaker, query string) (string, error) {
 	if vs.chat == nil {
 		return "", fmt.Errorf("no chat provider")
@@ -264,13 +273,65 @@ func (vs *voiceSubsystem) askPlain(ctx context.Context, channel, speaker, query 
 		Content: query,
 	})
 
-	msgs := vs.o.memory.BuildMessages(conv, sysPrompt, speakerNote, "")
+	messages := vs.o.memory.BuildMessages(conv, sysPrompt, speakerNote, "")
+	tools := vs.o.aiTools()
 
-	resp, err := vs.chat.Chat(ctx, ai.ChatRequest{Messages: msgs})
-	if err != nil {
-		return "", err
+	var answer string
+	for iter := 0; iter < voiceToolBudget; iter++ {
+		resp, err := vs.chat.Chat(ctx, ai.ChatRequest{
+			Messages: messages,
+			Tools:    tools,
+		})
+		if err != nil {
+			return "", err
+		}
+		asstTurn := ConvTurn{
+			Role:      ai.RoleAssistant,
+			Time:      time.Now().UTC(),
+			Content:   resp.Message.Content,
+			ToolCalls: resp.Message.ToolCalls,
+		}
+		conv.append(asstTurn)
+		vs.o.logger.AppendTurn(key, asstTurn)
+
+		if len(resp.Message.ToolCalls) == 0 {
+			answer = strings.TrimSpace(resp.Message.Content)
+			break
+		}
+
+		messages = append(messages, ai.Message{
+			Role:      ai.RoleAssistant,
+			Content:   resp.Message.Content,
+			ToolCalls: resp.Message.ToolCalls,
+		})
+		for _, tc := range resp.Message.ToolCalls {
+			params := map[string]any{}
+			if tc.Function.Arguments != "" {
+				_ = json.Unmarshal([]byte(tc.Function.Arguments), &params)
+			}
+			// Voice path has no WorkflowEmitter; invokeAITool tolerates nil.
+			result, terr := vs.o.invokeAITool(ctx, tc.Function.Name, params, nil)
+			if terr != nil {
+				result = fmt.Sprintf(`{"error":%q}`, terr.Error())
+			}
+			toolTurn := ConvTurn{
+				Role:     ai.RoleTool,
+				Time:     time.Now().UTC(),
+				Content:  result,
+				ToolName: tc.Function.Name,
+				ToolCall: tc,
+			}
+			conv.append(toolTurn)
+			vs.o.logger.AppendTurn(key, toolTurn)
+			messages = append(messages, ai.Message{
+				Role:       ai.RoleTool,
+				Content:    result,
+				Name:       tc.Function.Name,
+				ToolCallID: tc.ID,
+			})
+		}
 	}
-	answer := strings.TrimSpace(resp.Message.Content)
+
 	if answer == "" {
 		answer = "(no answer)"
 	}

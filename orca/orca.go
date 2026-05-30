@@ -33,6 +33,28 @@ type Orca struct {
 	commands  []bot.Command
 	handlers  map[string]Handler
 	aiToolMap map[string]Tool
+
+	// gw is the live pushbot Gateway when connected, nil otherwise.
+	// Set via SetGateway (bot.GatewayAware) at connect/disconnect.
+	// Used by the voice subsystem to mirror transcripts as PRIVMSGs
+	// into a channel outside any active invocation.
+	gwMu sync.RWMutex
+	gw   *bot.Gateway
+}
+
+// SetGateway implements bot.GatewayAware; called by the gateway when
+// it (re)connects and again with nil when it tears down.
+func (o *Orca) SetGateway(g *bot.Gateway) {
+	o.gwMu.Lock()
+	o.gw = g
+	o.gwMu.Unlock()
+}
+
+// Gateway returns the current live gateway, or nil if disconnected.
+func (o *Orca) Gateway() *bot.Gateway {
+	o.gwMu.RLock()
+	defer o.gwMu.RUnlock()
+	return o.gw
 }
 
 type Handler func(ctx context.Context, inv *bot.Invocation) error

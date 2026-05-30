@@ -72,6 +72,14 @@ type Bot interface {
 	OnEvent(ctx context.Context, eventName string, data json.RawMessage)
 }
 
+// GatewayAware is an optional Bot extension: implementers receive the
+// live *Gateway on connect (nil on disconnect) so they can send
+// spontaneous messages outside of an invocation context, e.g. Orca's
+// voice subsystem mirroring transcripts as PRIVMSG into a channel.
+type GatewayAware interface {
+	SetGateway(g *Gateway)
+}
+
 type Registry struct {
 	bots []Bot
 }

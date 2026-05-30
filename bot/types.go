@@ -15,7 +15,14 @@ const (
 	OpInteractionResponse = 21
 	OpInteractionDefer    = 22
 	OpWorkflowEvent       = 30
+	OpSendMessage         = 31
 )
+
+type SendMessageD struct {
+	Target   string `json:"target"`
+	Content  string `json:"content"`
+	IsNotice bool   `json:"is_notice,omitempty"`
+}
 
 type Frame struct {
 	Op   int             `json:"op"`
@@ -50,11 +57,9 @@ type CommandInvoke struct {
 	ID      string          `json:"id"`
 	Command string          `json:"name"`
 	Options json.RawMessage `json:"options"`
-	Nick    string          `json:"nick"`
 	Channel string          `json:"channel,omitempty"`
-	Msgid   string          `json:"msgid"`
-	Author  Author          `json:"author"`
-	Context string          `json:"context"`
+	Msgid   string          `json:"invoker_msgid"`
+	Author  Author          `json:"invoker"`
 }
 
 type InteractionResponse struct {

@@ -2,12 +2,14 @@ package bot
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -62,6 +64,11 @@ func connectAndRun(parent context.Context, b Bot, gatewayURL string) error {
 	}
 	defer gw.close()
 
+	if ga, ok := b.(GatewayAware); ok {
+		ga.SetGateway(gw)
+		defer ga.SetGateway(nil)
+	}
+
 	if err := gw.readHello(); err != nil {
 		return fmt.Errorf("hello: %w", err)
 	}
@@ -82,7 +89,14 @@ func (g *Gateway) dial() error {
 	}
 	headers := http.Header{}
 	headers.Set("User-Agent", "obbyircd-orca/0.1")
-	c, _, err := websocket.DefaultDialer.DialContext(g.ctx, u.String(), headers)
+	if tok := g.bot.Token(); tok != "" {
+		headers.Set("Authorization", "Bearer "+tok)
+	}
+	dialer := *websocket.DefaultDialer
+	if os.Getenv("PUSHBOT_INSECURE") == "1" {
+		dialer.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	}
+	c, _, err := dialer.DialContext(g.ctx, u.String(), headers)
 	if err != nil {
 		return err
 	}
@@ -175,6 +189,18 @@ func (g *Gateway) sendInteractionResponse(id, content, vis string, ephemeral boo
 func (g *Gateway) sendWorkflowEvent(target string, payload json.RawMessage) error {
 	d, _ := json.Marshal(WorkflowEventOut{Target: target, Payload: payload})
 	return g.send(Frame{Op: OpWorkflowEvent, D: d})
+}
+
+// SendMessage sends a spontaneous PRIVMSG (or NOTICE if isNotice) from
+// the bot's ghost to `target`. Target may be a channel (#/&/^/$) or a
+// nick. Doesn't piggyback on any interaction -- the bot is the source.
+func (g *Gateway) SendMessage(target, content string, isNotice bool) error {
+	d, _ := json.Marshal(SendMessageD{
+		Target:   target,
+		Content:  content,
+		IsNotice: isNotice,
+	})
+	return g.send(Frame{Op: OpSendMessage, D: d})
 }
 
 func (g *Gateway) readLoop() error {
