@@ -139,8 +139,25 @@ func (p *OpenAITranscribe) STT(ctx context.Context, req STTRequest) (*STTRespons
 	if mime == "" {
 		mime = "audio/wav"
 	}
+	// Pollinations/OVH STT sniffs the multipart filename's extension and
+	// 400s anything unrecognised (notably "audio.bin"). Map the mime to
+	// a known-good extension.
+	ext := "wav"
+	switch mime {
+	case "audio/mpeg", "audio/mp3":
+		ext = "mp3"
+	case "audio/webm":
+		ext = "webm"
+	case "audio/ogg", "audio/opus":
+		ext = "ogg"
+	case "audio/m4a", "audio/mp4", "audio/x-m4a":
+		ext = "m4a"
+	case "audio/flac":
+		ext = "flac"
+	}
 	header := textproto.MIMEHeader{}
-	header.Set("Content-Disposition", `form-data; name="file"; filename="audio.bin"`)
+	header.Set("Content-Disposition", fmt.Sprintf(
+		`form-data; name="file"; filename="audio.%s"`, ext))
 	header.Set("Content-Type", mime)
 	fw, err := mw.CreatePart(header)
 	if err != nil {
