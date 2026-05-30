@@ -517,11 +517,14 @@ func (m *voiceManager) handleJoin(nick, channel, account string) {
 		peer.role = "streamer"
 	}
 	room.peers[nick] = peer
-	members := make([]string, 0, len(room.peers))
+	members := make([]string, 0, len(room.peers)+len(room.localPeers))
 	for n := range room.peers {
 		if n == nick {
 			continue
 		}
+		members = append(members, n)
+	}
+	for n := range room.localPeers {
 		members = append(members, n)
 	}
 	streamers := streamerNicks(room.streamersUnsafe())

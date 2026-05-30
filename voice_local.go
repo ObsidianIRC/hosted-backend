@@ -86,6 +86,14 @@ func (m *voiceManager) RegisterLocal(nick, channel string, onRTP RTPCallback) (L
 	room.localPeers[nick] = lp
 	room.mu.Unlock()
 
+	m.broadcast(channel, "", signalEnvelope{
+		Type:    "presence",
+		Member:  nick,
+		State:   "joined",
+		Channel: channel,
+		Role:    "streamer",
+	})
+
 	log.Printf("voice/local: registered %s in %s", nick, channel)
 	return lp, nil
 }
@@ -204,10 +212,17 @@ func (lp *voiceLocalPeer) stop() {
 	if lp.room != nil {
 		lp.room.mu.Lock()
 		delete(lp.room.localPeers, lp.nick)
+		channel := lp.room.name
 		lp.room.mu.Unlock()
 		if lp.mgr != nil {
-			lp.mgr.clearLocalExpected(lp.room.name, lp.nick)
-			lp.mgr.reapEmpty(lp.room.name)
+			lp.mgr.broadcast(channel, "", signalEnvelope{
+				Type:    "presence",
+				Member:  lp.nick,
+				State:   "left",
+				Channel: channel,
+			})
+			lp.mgr.clearLocalExpected(channel, lp.nick)
+			lp.mgr.reapEmpty(channel)
 		}
 	}
 	log.Printf("voice/local: %s stopped", lp.nick)
