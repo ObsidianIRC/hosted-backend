@@ -190,18 +190,7 @@ func (vs *voiceSubsystem) handleUtterance(ctx context.Context, channel, speaker 
 		return
 	}
 
-	// Mirror the transcript into the voice channel itself as a PRIVMSG
-	// from Orca's ghost ("<speaker> their utterance"), so the text-side
-	// users see what was said in the call. Voice channels (^) accept
-	// PRIVMSGs, and the bot's pushbot gateway exposes a SendMessage
-	// op for spontaneous channel sends (no invocation context needed).
 	log.Printf("[orca/voice] %s/%s: %q", channel, speaker, transcript)
-	if gw := vs.o.Gateway(); gw != nil {
-		mirrorMsg := fmt.Sprintf("<%s> %s", speaker, transcript)
-		if err := gw.SendMessage(channel, mirrorMsg, false); err != nil {
-			log.Printf("[orca/voice] %s: mirror PRIVMSG: %v", channel, err)
-		}
-	}
 
 	matched, query := vs.wake.match(transcript)
 	if vs.cfg.WakeOnly && !matched {
@@ -219,6 +208,21 @@ func (vs *voiceSubsystem) handleUtterance(ctx context.Context, channel, speaker 
 		log.Printf("[orca/voice] %s/%s: ask: %v", channel, speaker, err)
 		return
 	}
+
+	// Mirror Orca's own spoken answer into the voice channel's text
+	// side as a PRIVMSG from Orca's ghost. Voice channels (^) accept
+	// PRIVMSGs and the pushbot gateway's PB_OP_SEND_MESSAGE lets us
+	// send spontaneously (no invocation context). Posted before TTS
+	// kicks off so the text shows up immediately even if TTS is slow
+	// or fails.
+	if answer != "" && answer != "(no answer)" {
+		if gw := vs.o.Gateway(); gw != nil {
+			if err := gw.SendMessage(channel, answer, false); err != nil {
+				log.Printf("[orca/voice] %s: mirror PRIVMSG: %v", channel, err)
+			}
+		}
+	}
+
 	if vs.tts == nil {
 		log.Printf("[orca/voice] %s answer (no TTS): %s", channel, truncate(answer, 200))
 		return
