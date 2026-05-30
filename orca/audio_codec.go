@@ -148,6 +148,15 @@ func DecodeWAV(data []byte) (pcm []int16, sampleRate int, channels int, err erro
 	for off+8 <= len(data) {
 		id := string(data[off : off+4])
 		sz := int(binary.LittleEndian.Uint32(data[off+4 : off+8]))
+		// Streaming WAV writers (e.g. Pollinations TTS) fill the chunk
+		// size with a placeholder near int32 max because the final
+		// length isn't known at header-write time. Treat any size that
+		// exceeds the remaining buffer as "everything left" rather
+		// than rejecting the file.
+		remaining := len(data) - off - 8
+		if sz < 0 || sz > remaining {
+			sz = remaining
+		}
 		body := data[off+8 : off+8+sz]
 		switch id {
 		case "fmt ":
