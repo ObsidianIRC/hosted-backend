@@ -324,6 +324,9 @@ type voiceRoom struct {
 	// from the channel-name prefix and never changes for the room's
 	// lifetime.
 	mode string
+	// In-process participants (see voice_local.go). Bot ghosts and any
+	// future server-side audio consumer slot in here and bypass WebRTC.
+	localPeers map[string]*voiceLocalPeer
 }
 
 // streamMaxStreamers caps how many co-streamers a $-channel can have at
@@ -381,6 +384,11 @@ type voiceManager struct {
 	// signalEnvelopes that need to land at a client funnel through
 	// here so the bridge can serialize -> JSON-tag -> TAGMSG.
 	outbound func(target, payload string) error
+	// Nicks that are expected to attach as local (in-process) participants
+	// for a given channel. Populated by RegisterLocal; consulted by
+	// handleJoin to skip PC creation when the IRC join arrives.
+	localMu       sync.RWMutex
+	localExpected map[string]map[string]bool
 }
 
 func newVoiceManager(cfg VoiceConfig) *voiceManager {
@@ -461,6 +469,12 @@ func (m *voiceManager) handleJoin(nick, channel, account string) {
 	if !strings.HasPrefix(channel, "^") && !strings.HasPrefix(channel, "$") {
 		m.send(nick, signalEnvelope{Type: "error",
 			Error: "not a voice or stream channel"})
+		return
+	}
+	if m.isLocalExpected(channel, nick) {
+		// In-process participant; the LocalPeer is created via
+		// RegisterLocal, not via signaling. Don't allocate a PC.
+		log.Printf("voice: %s is a local participant in %s; skip PC", nick, channel)
 		return
 	}
 	room := m.getOrCreateRoom(channel)
@@ -778,6 +792,9 @@ func (p *voicePeer) fanOutTrack(remote *webrtc.TrackRemote) {
 			if errors.Is(writeErr, webrtc.ErrConnectionClosed) {
 				return
 			}
+		}
+		if p.room != nil {
+			p.room.notifyLocalPeers(p.nick, kind, buf[:n])
 		}
 	}
 }

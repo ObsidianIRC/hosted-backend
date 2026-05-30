@@ -290,21 +290,22 @@ func (b *voiceBridge) send(target, payload string) error {
 	return nil
 }
 
-// startVoiceSubsystem boots TURN + bridge.  Returns a teardown func.
-// Errors from individual sub-systems are logged but don't fail the
-// whole backend; if VOICE_TURN_SECRET isn't set we simply skip voice
-// initialization.
-func startVoiceSubsystem(ctx context.Context) func() {
+// startVoiceSubsystem boots TURN + bridge.  Returns the manager (so
+// in-process consumers can register LocalParticipants) and a teardown
+// func. Errors from individual sub-systems are logged but don't fail
+// the whole backend; if VOICE_TURN_SECRET isn't set we simply skip
+// voice initialization and return (nil, no-op).
+func startVoiceSubsystem(ctx context.Context) (*voiceManager, func()) {
 	cfg := loadVoiceConfig()
 	if cfg.TurnAuthSecret == "" {
 		log.Printf("voice: VOICE_TURN_SECRET unset; voice subsystem disabled")
-		return func() {}
+		return nil, func() {}
 	}
 
 	turnSrv, err := startTurnServer(cfg)
 	if err != nil {
 		log.Printf("voice: TURN startup: %v", err)
-		return func() {}
+		return nil, func() {}
 	}
 
 	mgr := newVoiceManager(cfg)
@@ -315,7 +316,7 @@ func startVoiceSubsystem(ctx context.Context) func() {
 		}
 	}()
 
-	return func() {
+	return mgr, func() {
 		shutdownCtx, cancel := context.WithTimeout(
 			context.Background(), 5*time.Second)
 		defer cancel()

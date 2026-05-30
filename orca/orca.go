@@ -117,13 +117,18 @@ func (o *Orca) OnEvent(ctx context.Context, eventName string, data json.RawMessa
 }
 
 // Start registers Orca with the registry and starts gateway connections.
-// Call once at backend startup.
-func Start(ctx context.Context, irc IRC) (*bot.Registry, error) {
+// Call once at backend startup. `voiceAPI` may be nil; if provided, the
+// voice subsystem uses an in-process SFU LocalParticipant tap instead
+// of the default no-op.
+func Start(ctx context.Context, irc IRC, voiceAPI LocalParticipantAPI) (*bot.Registry, error) {
 	reg := bot.NewRegistry()
 	o := New(irc)
 	if o.token == "" {
 		log.Printf("[orca] ORCA_PUSHBOT_TOKEN unset; Orca disabled")
 		return reg, nil
+	}
+	if voiceAPI != nil {
+		o.voiceTap = NewLocalTap(voiceAPI, o.nick)
 	}
 	reg.Register(o)
 	gatewayURL := envOr("PUSHBOT_GATEWAY_URL", "ws://127.0.0.1:8600/pushbot/v1/gateway")

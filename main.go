@@ -216,7 +216,7 @@ func main() {
 	// bridge for obbyircd's voice-channels module.  No-ops with a
 	// log line if VOICE_TURN_SECRET is unset.
 	voiceCtx, voiceCancel := context.WithCancel(context.Background())
-	voiceShutdown := startVoiceSubsystem(voiceCtx)
+	voiceMgr, voiceShutdown := startVoiceSubsystem(voiceCtx)
 	defer func() {
 		voiceCancel()
 		voiceShutdown()
@@ -224,7 +224,11 @@ func main() {
 
 	orcaCtx, orcaCancel := context.WithCancel(context.Background())
 	defer orcaCancel()
-	if _, err := orca.Start(orcaCtx, ircAdapter{}); err != nil {
+	var orcaVoice orca.LocalParticipantAPI
+	if voiceMgr != nil {
+		orcaVoice = voiceAPIAdapter{mgr: voiceMgr}
+	}
+	if _, err := orca.Start(orcaCtx, ircAdapter{}, orcaVoice); err != nil {
 		fmt.Printf("orca: %v\n", err)
 	}
 
