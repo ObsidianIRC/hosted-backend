@@ -16,6 +16,8 @@ import (
 	"strings"
 	"time"
 
+	"backend/orca"
+
 	"github.com/disintegration/imaging"
 	"github.com/gorilla/mux"
 	"github.com/joho/godotenv"
@@ -219,6 +221,12 @@ func main() {
 		voiceCancel()
 		voiceShutdown()
 	}()
+
+	orcaCtx, orcaCancel := context.WithCancel(context.Background())
+	defer orcaCancel()
+	if _, err := orca.Start(orcaCtx, ircAdapter{}); err != nil {
+		fmt.Printf("orca: %v\n", err)
+	}
 
 	r := mux.NewRouter()
 
