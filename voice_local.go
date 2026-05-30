@@ -76,15 +76,39 @@ func (m *voiceManager) RegisterLocal(nick, channel string, onRTP RTPCallback) (L
 	if prev, ok := room.localPeers[nick]; ok {
 		prev.stop()
 	}
+	// Create the outbound audio track up-front so any peer that joins
+	// later picks it up in their initial SDP offer (no renegotiation),
+	// and any peer already in the room renegotiates BEFORE real audio
+	// arrives. Without this, the first ~200 ms of every TTS reply gets
+	// chopped because SendOpus would lazily create+subscribe the track
+	// at the same instant it writes the first packet.
+	track, terr := webrtc.NewTrackLocalStaticRTP(
+		webrtc.RTPCodecCapability{
+			MimeType:    webrtc.MimeTypeOpus,
+			ClockRate:   48000,
+			Channels:    2,
+			SDPFmtpLine: "minptime=10;useinbandfec=1",
+		},
+		fmt.Sprintf("%s-audio-local", nick),
+		nick,
+	)
+	if terr != nil {
+		room.mu.Unlock()
+		return nil, fmt.Errorf("local-audio track: %w", terr)
+	}
 	lp := &voiceLocalPeer{
 		nick:     nick,
 		room:     room,
 		mgr:      m,
 		onRTP:    onRTP,
 		joinedAt: time.Now(),
+		audio:    track,
 	}
 	room.localPeers[nick] = lp
 	room.mu.Unlock()
+
+	// Push the track to anyone already in the room (one-time renegotiate).
+	lp.subscribeOthersToTrack(track)
 
 	m.broadcast(channel, "", signalEnvelope{
 		Type:    "presence",
@@ -137,28 +161,12 @@ func (lp *voiceLocalPeer) SendOpus(rtpPacket []byte) error {
 		lp.mu.Unlock()
 		return errors.New("local peer stopped")
 	}
-	if lp.audio == nil {
-		track, err := webrtc.NewTrackLocalStaticRTP(
-			webrtc.RTPCodecCapability{
-				MimeType:    webrtc.MimeTypeOpus,
-				ClockRate:   48000,
-				Channels:    2,
-				SDPFmtpLine: "minptime=10;useinbandfec=1",
-			},
-			fmt.Sprintf("%s-audio-local", lp.nick),
-			lp.nick,
-		)
-		if err != nil {
-			lp.mu.Unlock()
-			return fmt.Errorf("local-audio track: %w", err)
-		}
-		lp.audio = track
-		lp.mu.Unlock()
-		lp.subscribeOthersToTrack(track)
-	} else {
-		lp.mu.Unlock()
+	track := lp.audio
+	lp.mu.Unlock()
+	if track == nil {
+		return errors.New("local peer has no audio track")
 	}
-	_, err := lp.audio.Write(rtpPacket)
+	_, err := track.Write(rtpPacket)
 	return err
 }
 

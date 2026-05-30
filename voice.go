@@ -542,7 +542,35 @@ func (m *voiceManager) handleJoin(nick, channel, account string) {
 				nick, other.nick, err)
 		}
 	}
+	// Also subscribe to in-process local peers' tracks so the very
+	// first packet they send (e.g. Orca's TTS reply) arrives on a
+	// track that's already in this peer's initial offer -- no
+	// mid-stream renegotiation, no chopped-off first 200 ms.
+	localPeers := make([]*voiceLocalPeer, 0, len(room.localPeers))
+	for _, lp := range room.localPeers {
+		localPeers = append(localPeers, lp)
+	}
 	room.mu.RUnlock()
+	for _, lp := range localPeers {
+		lp.mu.Lock()
+		track := lp.audio
+		lp.mu.Unlock()
+		if track == nil {
+			continue
+		}
+		s, err := pc.AddTrack(track)
+		if err != nil {
+			log.Printf("voice: subscribe %s -> local %s: %v",
+				nick, lp.nick, err)
+			continue
+		}
+		peer.mu.Lock()
+		if peer.subSenders == nil {
+			peer.subSenders = map[string]*webrtc.RTPSender{}
+		}
+		peer.subSenders[track.ID()] = s
+		peer.mu.Unlock()
+	}
 
 	// Hook ICE candidate emission so we relay them back to the client.
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
@@ -574,6 +602,7 @@ func (m *voiceManager) handleJoin(nick, channel, account string) {
 	})
 
 	turn := mintTurnCreds(m.cfg, account, 6*time.Hour)
+	log.Printf("voice: sending joined to %s in %s members=%v", nick, channel, members)
 	m.send(nick, signalEnvelope{
 		Type:      "joined",
 		Channel:   channel,
