@@ -21,7 +21,7 @@ type OpenAICompat struct {
 
 func NewOpenAICompat(baseURL, model, apiKey string) *OpenAICompat {
 	if baseURL == "" {
-		baseURL = "https://gen.pollinations.ai/openai"
+		baseURL = "https://gen.pollinations.ai/v1"
 	}
 	if model == "" {
 		model = "openai-large"
