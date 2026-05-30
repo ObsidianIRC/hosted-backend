@@ -25,6 +25,10 @@ type Orca struct {
 	memory *Memory
 	logger *Logger
 
+	voiceChannels []string
+	voiceTap      VoiceTap
+	voice         *voiceSubsystem
+
 	cmdMu     sync.RWMutex
 	commands  []bot.Command
 	handlers  map[string]Handler
@@ -126,8 +130,9 @@ func Start(ctx context.Context, irc IRC) (*bot.Registry, error) {
 	if err := reg.StartAll(ctx, gatewayURL); err != nil {
 		return nil, err
 	}
-	log.Printf("[orca] started as %s, channels=%v, commands=[%s]",
-		o.nick, o.channels, bot.CommandNames(o.commands))
+	o.startVoice(ctx)
+	log.Printf("[orca] started as %s, channels=%v, voice=%v, commands=[%s]",
+		o.nick, o.channels, o.voiceChannels, bot.CommandNames(o.commands))
 	return reg, nil
 }
 
