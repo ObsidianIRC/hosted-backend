@@ -116,9 +116,17 @@ func (t *localTap) Speak(ctx context.Context, channel string, audio []byte, mime
 
 // silenceRMS is the squared-amplitude threshold that marks a frame as
 // silence. ~30 dB below full-scale; works for typical voice levels.
+//
+// silenceFramesEnd is intentionally long (~1.5 s) so multi-word phrases
+// don't get chopped between words and sent to STT as one-word fragments.
+// minSpeechFrames gates flushing entirely on having actually heard speech
+// (not just silence) -- without this, a quiet room flushes 500-ms of
+// silence to STT every silenceFramesEnd window and Whisper returns
+// "[BLANK_AUDIO]" while the queue backs up.
 const (
 	silenceRMS         = 1.0e5
-	silenceFramesEnd   = 25 // 25 * 20 ms = 500 ms of silence ends an utterance
+	silenceFramesEnd   = 75   // 75 * 20 ms = 1.5 s of silence ends an utterance
+	minSpeechFrames    = 15   // 300 ms of actual speech required before we'll flush
 	maxUtteranceFrames = 1500 // hard cap ~30 s
 )
 
@@ -138,6 +146,7 @@ type speakerStream struct {
 	dec         *OpusDecoder
 	pcm         []int16
 	silentCount int
+	speechCount int
 	frames      int
 	lastSeen    time.Time
 }
@@ -181,11 +190,35 @@ func (d *speakerDemux) feed(speaker string, rtpPacket []byte) {
 		st.silentCount++
 	} else {
 		st.silentCount = 0
+		st.speechCount++
 	}
 
-	if st.silentCount >= silenceFramesEnd || st.frames >= maxUtteranceFrames {
+	switch {
+	case st.frames >= maxUtteranceFrames:
+		// Hard cap: flush whatever we have to keep memory bounded,
+		// even if it's mostly silence.
 		d.flush(ssrc, true)
+	case st.silentCount >= silenceFramesEnd && st.speechCount >= minSpeechFrames:
+		// End-of-utterance: long enough silence AND we heard real speech.
+		d.flush(ssrc, true)
+	case st.silentCount >= silenceFramesEnd:
+		// Long silence with no speech in the buffer: drop the silent
+		// frames so we don't ship pure-silence chunks to STT and rack
+		// up "[BLANK_AUDIO]" responses.
+		d.drop(ssrc)
 	}
+}
+
+func (d *speakerDemux) drop(ssrc uint32) {
+	d.mu.Lock()
+	st := d.streams[ssrc]
+	if st != nil {
+		st.pcm = nil
+		st.frames = 0
+		st.silentCount = 0
+		st.speechCount = 0
+	}
+	d.mu.Unlock()
 }
 
 func (d *speakerDemux) flush(ssrc uint32, endOfUtterance bool) {
@@ -200,6 +233,7 @@ func (d *speakerDemux) flush(ssrc uint32, endOfUtterance bool) {
 	st.pcm = nil
 	st.frames = 0
 	st.silentCount = 0
+	st.speechCount = 0
 	d.mu.Unlock()
 
 	// STT prefers mono 16 kHz; downconvert here so wavWrap doesn't have
