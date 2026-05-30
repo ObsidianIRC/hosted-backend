@@ -458,7 +458,7 @@ func streamerNicks(peers []*voicePeer) []string {
 func (m *voiceManager) reapEmpty(name string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if r, ok := m.rooms[name]; ok && len(r.peers) == 0 {
+	if r, ok := m.rooms[name]; ok && len(r.peers) == 0 && len(r.localPeers) == 0 {
 		delete(m.rooms, name)
 	}
 }
