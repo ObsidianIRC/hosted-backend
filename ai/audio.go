@@ -29,7 +29,7 @@ func TTSFromEnv() *OpenAIAudio {
 	}
 	base := os.Getenv("AI_TTS_BASE_URL")
 	if base == "" {
-		base = "https://text.pollinations.ai/openai"
+		base = "https://gen.pollinations.ai/openai"
 	}
 	model := os.Getenv("AI_TTS_MODEL")
 	if model == "" {
@@ -110,7 +110,7 @@ func STTFromEnv() *OpenAITranscribe {
 	}
 	base := os.Getenv("AI_STT_BASE_URL")
 	if base == "" {
-		base = "https://text.pollinations.ai/openai"
+		base = "https://gen.pollinations.ai/openai"
 	}
 	model := os.Getenv("AI_STT_MODEL")
 	if model == "" {
