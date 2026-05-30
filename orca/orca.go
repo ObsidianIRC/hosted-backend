@@ -22,9 +22,13 @@ type Orca struct {
 	tts  ai.TTSProvider
 	stt  ai.STTProvider
 
-	cmdMu    sync.RWMutex
-	commands []bot.Command
-	handlers map[string]Handler
+	memory *Memory
+	logger *Logger
+
+	cmdMu     sync.RWMutex
+	commands  []bot.Command
+	handlers  map[string]Handler
+	aiToolMap map[string]Tool
 }
 
 type Handler func(ctx context.Context, inv *bot.Invocation) error
@@ -34,16 +38,21 @@ func New(irc IRC) *Orca {
 	token := os.Getenv("ORCA_PUSHBOT_TOKEN")
 	channels := splitCSV(envOr("ORCA_CHANNELS", "#opers"))
 
+	chat := ai.ChatFromEnv()
 	o := &Orca{
-		nick:     nick,
-		token:    token,
-		channels: channels,
-		irc:      irc,
-		chat:     ai.ChatFromEnv(),
-		tts:      ai.TTSFromEnv(),
-		stt:      ai.STTFromEnv(),
-		handlers: map[string]Handler{},
+		nick:      nick,
+		token:     token,
+		channels:  channels,
+		irc:       irc,
+		chat:      chat,
+		tts:       ai.TTSFromEnv(),
+		stt:       ai.STTFromEnv(),
+		memory:    NewMemory(chat),
+		logger:    OpenLogger(os.Getenv("ORCA_LOG_DB")),
+		handlers:  map[string]Handler{},
+		aiToolMap: map[string]Tool{},
 	}
+	o.registerDefaultTools()
 	o.registerCommands()
 	return o
 }
@@ -73,6 +82,7 @@ func (o *Orca) registerCommands() {
 	o.registerCommand(scanCommand, o.cmdScan)
 	o.registerCommand(explainCommand, o.cmdExplain)
 	o.registerCommand(synthBanCommand, o.cmdSynthBan)
+	o.registerCommand(askCommand, o.cmdAsk)
 }
 
 func (o *Orca) OnInvoke(ctx context.Context, inv *bot.Invocation) error {
@@ -94,6 +104,11 @@ func (o *Orca) OnEvent(ctx context.Context, eventName string, data json.RawMessa
 		var wa bot.WorkflowAction
 		_ = json.Unmarshal(data, &wa)
 		log.Printf("[orca] workflow action %s on %s from %s", wa.Action, wa.Target, wa.From.Nick)
+		contentStr := ""
+		if len(wa.Content) > 0 {
+			contentStr = string(wa.Content)
+		}
+		o.logger.AppendAction(wa.WID, wa.Action, wa.Target, wa.From.Nick, contentStr)
 	}
 }
 
