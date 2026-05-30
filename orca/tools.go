@@ -97,6 +97,103 @@ func (o *Orca) registerDefaultTools() {
 		).required("mask").build(),
 		Handler: toolExplainMask,
 	})
+
+	// --- Admin actions: destructive, IRCop-only -------------------------
+
+	o.registerTool(Tool{
+		Name:        "user_kill",
+		Description: "Disconnect a user from the network (server-side KILL). The user is told the reason and dropped immediately.",
+		Parameters: objectSchema(
+			prop("nick", "string", "Nickname of the user to disconnect."),
+			prop("reason", "string", "Reason shown to the user and other opers."),
+		).required("nick", "reason").build(),
+		Handler: toolUserKill,
+	})
+	o.registerTool(Tool{
+		Name:        "channel_kick",
+		Description: "Kick a user from a specific channel (channel.kick RPC). User stays connected but leaves that one channel.",
+		Parameters: objectSchema(
+			prop("channel", "string", "Channel to kick from, including its prefix (e.g. #opers)."),
+			prop("nick", "string", "Nickname to kick."),
+			prop("reason", "string", "Reason shown in the kick."),
+		).required("channel", "nick", "reason").build(),
+		Handler: toolChannelKick,
+	})
+	o.registerTool(Tool{
+		Name:        "channel_set_topic",
+		Description: "Set the topic of a channel.",
+		Parameters: objectSchema(
+			prop("channel", "string", "Channel name."),
+			prop("topic", "string", "New topic text."),
+		).required("channel", "topic").build(),
+		Handler: toolChannelSetTopic,
+	})
+	o.registerTool(Tool{
+		Name:        "channel_set_mode",
+		Description: "Set channel modes. modes is the IRC mode string (e.g. '+m', '-o'). parameters is the space-joined argument list for modes that take one (e.g. nick for +o), empty string if none.",
+		Parameters: objectSchema(
+			prop("channel", "string", "Channel name."),
+			prop("modes", "string", "Mode string, e.g. '+m' or '+bo'."),
+			prop("parameters", "string", "Mode parameters, space-separated, or empty."),
+		).required("channel", "modes", "parameters").build(),
+		Handler: toolChannelSetMode,
+	})
+	o.registerTool(Tool{
+		Name:        "ban_add",
+		Description: "Add a server-side ban. type is one of: gline (network-wide ban), kline (this-server ban), zline (IP ban this server), gzline (IP ban network), shun (silence user), spamfilter. name is the mask (e.g. *@badhost.com). duration uses UnrealIRCd time format (e.g. '1d', '30m', '0' or empty for permanent).",
+		Parameters: objectSchema(
+			prop("type", "string", "Ban type: gline, kline, zline, gzline, shun, spamfilter."),
+			prop("name", "string", "Mask, e.g. *@bad.example.com or nick!*@*."),
+			prop("reason", "string", "Reason shown to the banned user and stored in the ban entry."),
+			prop("duration", "string", "Duration: '1d', '30m', '2w'. Empty/'0' = permanent."),
+		).required("type", "name", "reason").build(),
+		Handler: toolBanAdd,
+	})
+	o.registerTool(Tool{
+		Name:        "ban_del",
+		Description: "Remove a server-side ban. type + name must match exactly an existing entry from bans_list.",
+		Parameters: objectSchema(
+			prop("type", "string", "Ban type: gline, kline, zline, gzline, shun, spamfilter."),
+			prop("name", "string", "Exact mask of the ban to remove."),
+		).required("type", "name").build(),
+		Handler: toolBanDel,
+	})
+	o.registerTool(Tool{
+		Name:        "nick_ban_add",
+		Description: "Add a nick-name ban (Q-line). Prevents anyone from using that nickname.",
+		Parameters: objectSchema(
+			prop("name", "string", "Nickname pattern to forbid, e.g. BadNick or evilbot*."),
+			prop("reason", "string", "Reason shown to users trying that nick."),
+			prop("duration", "string", "Duration: '1d', '30m'. Empty = permanent."),
+		).required("name", "reason").build(),
+		Handler: toolNickBanAdd,
+	})
+	o.registerTool(Tool{
+		Name:        "nick_ban_del",
+		Description: "Remove a nick-name ban (Q-line).",
+		Parameters: objectSchema(
+			prop("name", "string", "Exact nickname pattern of the Q-line to remove."),
+		).required("name").build(),
+		Handler: toolNickBanDel,
+	})
+	o.registerTool(Tool{
+		Name:        "server_rehash",
+		Description: "Reload the obbyircd configuration (rehash). Equivalent to /REHASH.",
+		Parameters:  objectSchema().build(),
+		Handler:     toolServerRehash,
+	})
+	o.registerTool(Tool{
+		Name:        "server_list",
+		Description: "List linked servers on the network with their basic info.",
+		Parameters:  objectSchema().build(),
+		Handler:     toolServerList,
+	})
+	o.registerTool(Tool{
+		Name:        "spamfilter_list",
+		Description: "List all configured spamfilter rules.",
+		Parameters:  objectSchema().build(),
+		Handler:     toolSpamfilterList,
+	})
 }
 
 func toolUserGet(ctx context.Context, o *Orca, params map[string]any, w *bot.WorkflowEmitter) (string, error) {
@@ -236,6 +333,170 @@ func toolExplainMask(ctx context.Context, o *Orca, params map[string]any, w *bot
 	}
 	b, _ := json.Marshal(res)
 	_ = st.Result(fmt.Sprintf("%d/%d matched", len(matched), len(users)))
+	return string(b), nil
+}
+
+// --- Admin tool handlers ------------------------------------------------
+
+func toolUserKill(ctx context.Context, o *Orca, params map[string]any, w *bot.WorkflowEmitter) (string, error) {
+	nick, _ := params["nick"].(string)
+	reason, _ := params["reason"].(string)
+	if nick == "" || reason == "" {
+		return "", fmt.Errorf("nick and reason required")
+	}
+	st := w.StartToolCall("user-kill", "KILL "+nick, params)
+	if err := newIRCTool(o.irc).UserKill(ctx, nick, reason); err != nil {
+		_ = st.Failed(err.Error())
+		return "", err
+	}
+	_ = st.Result("killed " + nick)
+	return fmt.Sprintf(`{"ok":true,"killed":%q,"reason":%q}`, nick, reason), nil
+}
+
+func toolChannelKick(ctx context.Context, o *Orca, params map[string]any, w *bot.WorkflowEmitter) (string, error) {
+	channel, _ := params["channel"].(string)
+	nick, _ := params["nick"].(string)
+	reason, _ := params["reason"].(string)
+	if channel == "" || nick == "" || reason == "" {
+		return "", fmt.Errorf("channel, nick, reason required")
+	}
+	st := w.StartToolCall("channel-kick", fmt.Sprintf("KICK %s from %s", nick, channel), params)
+	if err := newIRCTool(o.irc).ChannelKick(ctx, channel, nick, reason); err != nil {
+		_ = st.Failed(err.Error())
+		return "", err
+	}
+	_ = st.Result(fmt.Sprintf("kicked %s from %s", nick, channel))
+	return fmt.Sprintf(`{"ok":true,"channel":%q,"kicked":%q}`, channel, nick), nil
+}
+
+func toolChannelSetTopic(ctx context.Context, o *Orca, params map[string]any, w *bot.WorkflowEmitter) (string, error) {
+	channel, _ := params["channel"].(string)
+	topic, _ := params["topic"].(string)
+	if channel == "" {
+		return "", fmt.Errorf("channel required")
+	}
+	st := w.StartToolCall("channel-set-topic", "TOPIC "+channel, params)
+	if err := newIRCTool(o.irc).ChannelSetTopic(ctx, channel, topic); err != nil {
+		_ = st.Failed(err.Error())
+		return "", err
+	}
+	_ = st.Result("topic set")
+	return fmt.Sprintf(`{"ok":true,"channel":%q}`, channel), nil
+}
+
+func toolChannelSetMode(ctx context.Context, o *Orca, params map[string]any, w *bot.WorkflowEmitter) (string, error) {
+	channel, _ := params["channel"].(string)
+	modes, _ := params["modes"].(string)
+	parameters, _ := params["parameters"].(string)
+	if channel == "" || modes == "" {
+		return "", fmt.Errorf("channel and modes required")
+	}
+	st := w.StartToolCall("channel-set-mode", fmt.Sprintf("MODE %s %s %s", channel, modes, parameters), params)
+	if err := newIRCTool(o.irc).ChannelSetMode(ctx, channel, modes, parameters); err != nil {
+		_ = st.Failed(err.Error())
+		return "", err
+	}
+	_ = st.Result("mode applied")
+	return fmt.Sprintf(`{"ok":true,"channel":%q,"modes":%q}`, channel, modes), nil
+}
+
+func toolBanAdd(ctx context.Context, o *Orca, params map[string]any, w *bot.WorkflowEmitter) (string, error) {
+	banType, _ := params["type"].(string)
+	name, _ := params["name"].(string)
+	reason, _ := params["reason"].(string)
+	duration, _ := params["duration"].(string)
+	if banType == "" || name == "" || reason == "" {
+		return "", fmt.Errorf("type, name, reason required")
+	}
+	st := w.StartToolCall("ban-add", fmt.Sprintf("%s %s", banType, name), params)
+	if err := newIRCTool(o.irc).BanAdd(ctx, banType, name, reason, duration); err != nil {
+		_ = st.Failed(err.Error())
+		return "", err
+	}
+	dur := duration
+	if dur == "" {
+		dur = "permanent"
+	}
+	_ = st.Result(fmt.Sprintf("%s %s (%s)", banType, name, dur))
+	return fmt.Sprintf(`{"ok":true,"type":%q,"name":%q,"duration":%q}`, banType, name, dur), nil
+}
+
+func toolBanDel(ctx context.Context, o *Orca, params map[string]any, w *bot.WorkflowEmitter) (string, error) {
+	banType, _ := params["type"].(string)
+	name, _ := params["name"].(string)
+	if banType == "" || name == "" {
+		return "", fmt.Errorf("type and name required")
+	}
+	st := w.StartToolCall("ban-del", fmt.Sprintf("%s %s", banType, name), params)
+	if err := newIRCTool(o.irc).BanDel(ctx, banType, name); err != nil {
+		_ = st.Failed(err.Error())
+		return "", err
+	}
+	_ = st.Result("removed " + name)
+	return fmt.Sprintf(`{"ok":true,"removed":%q}`, name), nil
+}
+
+func toolNickBanAdd(ctx context.Context, o *Orca, params map[string]any, w *bot.WorkflowEmitter) (string, error) {
+	name, _ := params["name"].(string)
+	reason, _ := params["reason"].(string)
+	duration, _ := params["duration"].(string)
+	if name == "" || reason == "" {
+		return "", fmt.Errorf("name and reason required")
+	}
+	st := w.StartToolCall("nick-ban-add", name, params)
+	if err := newIRCTool(o.irc).NickBanAdd(ctx, name, reason, duration); err != nil {
+		_ = st.Failed(err.Error())
+		return "", err
+	}
+	_ = st.Result("Q-lined " + name)
+	return fmt.Sprintf(`{"ok":true,"name":%q}`, name), nil
+}
+
+func toolNickBanDel(ctx context.Context, o *Orca, params map[string]any, w *bot.WorkflowEmitter) (string, error) {
+	name, _ := params["name"].(string)
+	if name == "" {
+		return "", fmt.Errorf("name required")
+	}
+	st := w.StartToolCall("nick-ban-del", name, params)
+	if err := newIRCTool(o.irc).NickBanDel(ctx, name); err != nil {
+		_ = st.Failed(err.Error())
+		return "", err
+	}
+	_ = st.Result("removed " + name)
+	return fmt.Sprintf(`{"ok":true,"removed":%q}`, name), nil
+}
+
+func toolServerRehash(ctx context.Context, o *Orca, params map[string]any, w *bot.WorkflowEmitter) (string, error) {
+	st := w.StartToolCall("server-rehash", "/REHASH", nil)
+	if err := newIRCTool(o.irc).ServerRehash(ctx); err != nil {
+		_ = st.Failed(err.Error())
+		return "", err
+	}
+	_ = st.Result("rehashed")
+	return `{"ok":true}`, nil
+}
+
+func toolServerList(ctx context.Context, o *Orca, params map[string]any, w *bot.WorkflowEmitter) (string, error) {
+	st := w.StartToolCall("server-list", "Linked servers", nil)
+	servers, err := newIRCTool(o.irc).ServerList(ctx)
+	if err != nil {
+		_ = st.Failed(err.Error())
+		return "", err
+	}
+	b, _ := json.Marshal(servers)
+	_ = st.Result(fmt.Sprintf("%d servers", len(servers)))
+	return string(b), nil
+}
+
+func toolSpamfilterList(ctx context.Context, o *Orca, params map[string]any, w *bot.WorkflowEmitter) (string, error) {
+	st := w.StartToolCall("spamfilter-list", "Spamfilter rules", nil)
+	rules, err := newIRCTool(o.irc).SpamfilterList(ctx)
+	if err != nil {
+		_ = st.Failed(err.Error())
+		return "", err
+	}
+	b, _ := json.Marshal(rules)
+	_ = st.Result(fmt.Sprintf("%d rules", len(rules)))
 	return string(b), nil
 }
 

@@ -93,6 +93,140 @@ func (t *ircTool) BansList(ctx context.Context) ([]map[string]any, error) {
 	return toMapList(res, "list"), nil
 }
 
+// --- Admin actions (destructive RPC calls) -------------------------------
+
+func (t *ircTool) UserKill(ctx context.Context, nick, reason string) error {
+	if t.irc == nil {
+		return errors.New("no IRC connection")
+	}
+	_, err := t.irc.Query(ctx, "user.kill", map[string]any{
+		"nick":   nick,
+		"reason": reason,
+	})
+	return err
+}
+
+func (t *ircTool) ChannelKick(ctx context.Context, channel, nick, reason string) error {
+	if t.irc == nil {
+		return errors.New("no IRC connection")
+	}
+	_, err := t.irc.Query(ctx, "channel.kick", map[string]any{
+		"channel": channel,
+		"nick":    nick,
+		"reason":  reason,
+	})
+	return err
+}
+
+func (t *ircTool) ChannelSetTopic(ctx context.Context, channel, topic string) error {
+	if t.irc == nil {
+		return errors.New("no IRC connection")
+	}
+	_, err := t.irc.Query(ctx, "channel.set_topic", map[string]any{
+		"channel": channel,
+		"topic":   topic,
+	})
+	return err
+}
+
+func (t *ircTool) ChannelSetMode(ctx context.Context, channel, modes, parameters string) error {
+	if t.irc == nil {
+		return errors.New("no IRC connection")
+	}
+	_, err := t.irc.Query(ctx, "channel.set_mode", map[string]any{
+		"channel":    channel,
+		"modes":      modes,
+		"parameters": parameters,
+	})
+	return err
+}
+
+// BanAdd applies a server-wide ban. `banType` is the UnrealIRCd
+// type-name (gline / kline / zline / gzline / shun / spamfilter).
+// `name` is the mask (e.g. *@bad.example.com or user@*).
+// duration "" = permanent; UnrealIRCd time format ("1d", "30m", etc.)
+func (t *ircTool) BanAdd(ctx context.Context, banType, name, reason, duration string) error {
+	if t.irc == nil {
+		return errors.New("no IRC connection")
+	}
+	p := map[string]any{
+		"name":   name,
+		"type":   banType,
+		"reason": reason,
+	}
+	if duration != "" {
+		p["duration_string"] = duration
+	}
+	_, err := t.irc.Query(ctx, "server_ban.add", p)
+	return err
+}
+
+func (t *ircTool) BanDel(ctx context.Context, banType, name string) error {
+	if t.irc == nil {
+		return errors.New("no IRC connection")
+	}
+	_, err := t.irc.Query(ctx, "server_ban.del", map[string]any{
+		"name": name,
+		"type": banType,
+	})
+	return err
+}
+
+func (t *ircTool) NickBanAdd(ctx context.Context, name, reason, duration string) error {
+	if t.irc == nil {
+		return errors.New("no IRC connection")
+	}
+	p := map[string]any{
+		"name":   name,
+		"reason": reason,
+	}
+	if duration != "" {
+		p["duration_string"] = duration
+	}
+	_, err := t.irc.Query(ctx, "name_ban.add", p)
+	return err
+}
+
+func (t *ircTool) NickBanDel(ctx context.Context, name string) error {
+	if t.irc == nil {
+		return errors.New("no IRC connection")
+	}
+	_, err := t.irc.Query(ctx, "name_ban.del", map[string]any{
+		"name": name,
+	})
+	return err
+}
+
+func (t *ircTool) ServerRehash(ctx context.Context) error {
+	if t.irc == nil {
+		return errors.New("no IRC connection")
+	}
+	_, err := t.irc.Query(ctx, "server.rehash", nil)
+	return err
+}
+
+func (t *ircTool) ServerList(ctx context.Context) ([]map[string]any, error) {
+	if t.irc == nil {
+		return nil, errors.New("no IRC connection")
+	}
+	res, err := t.irc.Query(ctx, "server.list", nil)
+	if err != nil {
+		return nil, err
+	}
+	return toMapList(res, "list"), nil
+}
+
+func (t *ircTool) SpamfilterList(ctx context.Context) ([]map[string]any, error) {
+	if t.irc == nil {
+		return nil, errors.New("no IRC connection")
+	}
+	res, err := t.irc.Query(ctx, "spamfilter.list", nil)
+	if err != nil {
+		return nil, err
+	}
+	return toMapList(res, "list"), nil
+}
+
 func (t *ircTool) Stats(ctx context.Context) (map[string]any, error) {
 	if t.irc == nil {
 		return nil, errors.New("no IRC connection")
