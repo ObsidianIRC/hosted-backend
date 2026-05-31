@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"backend/ai"
 	"backend/bot"
@@ -61,7 +62,9 @@ func newAddressMatcher(nick string) *addressMatcher {
 
 // match returns (addressed, query). If addressed=false, the message
 // isn't for us. Query is the residual text after the addressing
-// prefix is stripped; empty query means a bare ping like "Orca?".
+// prefix is stripped, preserving ALL original punctuation in the
+// remainder (URLs, etc.) -- only the addressing-detection itself
+// strips punctuation. Empty query means a bare ping like "Orca?".
 func (m *addressMatcher) match(text string) (bool, string) {
 	if m.nick == "" {
 		return false, ""
@@ -86,12 +89,63 @@ func (m *addressMatcher) match(text string) (bool, string) {
 		return false, ""
 	}
 
-	rest := strings.TrimSpace(strings.Join(tokens[idx+1:], " "))
+	// Slice the ORIGINAL text after the (idx+1)-th word so URLs and
+	// other punctuation-laden content survive intact.
+	rest := strings.TrimSpace(sliceAfterNWords(t, idx+1))
 	if rest == "" {
 		// e.g. just "Orca?" or "Hey Orca" -- treat as a ping.
 		return true, "(Acknowledge briefly that you're here.)"
 	}
 	return true, rest
+}
+
+// sliceAfterNWords walks the original text and returns whatever
+// comes after the n-th alphanumeric word boundary, with leading
+// addressing punctuation (commas, colons, dashes, etc.) trimmed --
+// but not URL-significant characters within the remainder.
+func sliceAfterNWords(s string, n int) string {
+	if n <= 0 {
+		return s
+	}
+	seen := 0
+	inWord := false
+	i := 0
+	for i < len(s) {
+		r, sz := utf8.DecodeRuneInString(s[i:])
+		isWord := unicode.IsLetter(r) || unicode.IsDigit(r)
+		if isWord {
+			inWord = true
+		} else if inWord {
+			inWord = false
+			seen++
+			if seen >= n {
+				return strings.TrimLeftFunc(s[i:], addressTrailingSep)
+			}
+		}
+		i += sz
+	}
+	// Ended inside a word; that counts as one more.
+	if inWord {
+		seen++
+	}
+	if seen >= n {
+		return ""
+	}
+	return ""
+}
+
+// addressTrailingSep matches the punctuation that typically appears
+// right after the address ("hey orca, ...", "orca: ...", "orca - ..."),
+// but stops at anything that could be the first character of a
+// real query (letters, digits, '/', '@', '#', '+').
+func addressTrailingSep(r rune) bool {
+	switch r {
+	case ' ', '\t', '\r', '\n',
+		',', '.', ':', ';', '!', '?',
+		'-', '—', '–':
+		return true
+	}
+	return false
 }
 
 // tokenizeStrippingPunct turns the message into whitespace-separated
