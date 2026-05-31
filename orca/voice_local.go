@@ -1,9 +1,15 @@
 package orca
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"log"
+	"os"
+	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -366,6 +372,21 @@ func speakOpus(ctx context.Context, peer LocalPeer, audio []byte, mime string, e
 		pcm = Resample(pcm, srcRate, opusSampleRate, srcChannels)
 	}
 
+	// Optional speed-up via ffmpeg's atempo filter (high-quality
+	// time-stretch -- doesn't shift pitch). Configurable via
+	// ORCA_TTS_SPEED env, default 1.0 = no change. Useful range
+	// 0.5..2.0 per atempo's spec; we chain filters above that.
+	if speed := ttsSpeed(); speed > 0 && speed != 1.0 {
+		stretched, err := stretchPCM(pcm, opusSampleRate, srcChannels, speed)
+		if err != nil {
+			// Don't fail the whole reply if speed adjustment dies --
+			// just play at original tempo.
+			log.Printf("[orca/voice] atempo failed (%v), playing at 1x", err)
+		} else {
+			pcm = stretched
+		}
+	}
+
 	// Prepend silence so the first words of the actual reply don't
 	// get clipped by jitter-buffer warmup on the receiver.
 	silence := make([]int16,
@@ -422,3 +443,83 @@ func speakOpus(ctx context.Context, peer LocalPeer, audio []byte, mime string, e
 	}
 	return nil
 }
+
+// ttsSpeed reads ORCA_TTS_SPEED env (default 1.0). Anything outside
+// the (0, 4.0] range is clamped to 1.0 so a bad config can't kill
+// audio.
+func ttsSpeed() float64 {
+	v := os.Getenv("ORCA_TTS_SPEED")
+	if v == "" {
+		return 1.0
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil || f <= 0 || f > 4.0 {
+		return 1.0
+	}
+	return f
+}
+
+// stretchPCM runs the interleaved int16 PCM through ffmpeg's atempo
+// filter and returns the time-stretched samples. Pitch is preserved.
+// atempo's per-instance range is [0.5, 2.0]; for ratios outside that
+// we chain multiple atempo filters (each at the boundary).
+func stretchPCM(pcm []int16, sampleRate, channels int, speed float64) ([]int16, error) {
+	// Pack int16 -> little-endian bytes for ffmpeg's s16le format.
+	raw := make([]byte, len(pcm)*2)
+	for i, s := range pcm {
+		binary.LittleEndian.PutUint16(raw[2*i:], uint16(s))
+	}
+
+	// Chain atempo filters: each handles a single 0.5..2.0 ratio.
+	// Composed product equals requested speed.
+	filter := buildAtempoChain(speed)
+
+	cmd := exec.Command("ffmpeg",
+		"-hide_banner", "-loglevel", "error",
+		"-f", "s16le",
+		"-ar", strconv.Itoa(sampleRate),
+		"-ac", strconv.Itoa(channels),
+		"-i", "pipe:0",
+		"-af", filter,
+		"-f", "s16le",
+		"-ar", strconv.Itoa(sampleRate),
+		"-ac", strconv.Itoa(channels),
+		"pipe:1",
+	)
+	cmd.Stdin = bytes.NewReader(raw)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("ffmpeg atempo: %w", err)
+	}
+
+	body := out.Bytes()
+	stretched := make([]int16, len(body)/2)
+	for i := range stretched {
+		stretched[i] = int16(binary.LittleEndian.Uint16(body[2*i:]))
+	}
+	return stretched, nil
+}
+
+// buildAtempoChain returns a comma-separated atempo filter string
+// whose product equals the target speed. atempo's valid per-stage
+// range is [0.5, 2.0]; we cascade boundary stages then a final
+// remainder stage.
+func buildAtempoChain(target float64) string {
+	parts := []string{}
+	remain := target
+	for remain > 2.0 {
+		parts = append(parts, "atempo=2.0")
+		remain /= 2.0
+	}
+	for remain < 0.5 {
+		parts = append(parts, "atempo=0.5")
+		remain /= 0.5
+	}
+	parts = append(parts, "atempo="+strconv.FormatFloat(remain, 'f', 4, 64))
+	return strings.Join(parts, ",")
+}
+
+// _ keeps the io import alive if removed later by accident.
+var _ = io.EOF
