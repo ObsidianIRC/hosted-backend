@@ -64,6 +64,57 @@ type voiceSubsystem struct {
 	// per channel. play_video preempts any prior; stop_video kills it.
 	videoMu     sync.Mutex
 	activeVideo map[string]*videoPlayer
+
+	// activeTTS holds the cancel func for the current in-flight TTS
+	// playback per channel. A new wake-matched utterance cancels it
+	// so the user can barge in instead of waiting for Orca to finish.
+	ttsMu     sync.Mutex
+	activeTTS map[string]context.CancelFunc
+}
+
+// armTTS preempts any in-flight TTS playback for the channel and
+// returns a fresh cancellable context the caller should pass through
+// to the TTS + Speak pipeline. On a brand new wake utterance, calling
+// this is what stops Orca mid-sentence so the new ask can land.
+func (vs *voiceSubsystem) armTTS(parent context.Context, channel string) context.Context {
+	vs.ttsMu.Lock()
+	if vs.activeTTS == nil {
+		vs.activeTTS = map[string]context.CancelFunc{}
+	}
+	if prev, ok := vs.activeTTS[channel]; ok && prev != nil {
+		prev()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	vs.activeTTS[channel] = cancel
+	vs.ttsMu.Unlock()
+	return ctx
+}
+
+// disarmTTS clears the active TTS handle for the channel without
+// cancelling (called by the caller once Speak returns normally).
+func (vs *voiceSubsystem) disarmTTS(channel string, ctx context.Context) {
+	vs.ttsMu.Lock()
+	if cancel, ok := vs.activeTTS[channel]; ok && cancel != nil {
+		// Only delete if this is still the active one (don't blow
+		// away a newer playback that armed after us).
+		if ctx.Err() == nil {
+			cancel()
+			delete(vs.activeTTS, channel)
+		}
+	}
+	vs.ttsMu.Unlock()
+}
+
+// cancelTTS preempts any active TTS in the channel without arming a
+// new one. Used by wake-only pings: we want to silence Orca mid-reply
+// so the speaker has room for their follow-up.
+func (vs *voiceSubsystem) cancelTTS(channel string) {
+	vs.ttsMu.Lock()
+	if cancel, ok := vs.activeTTS[channel]; ok && cancel != nil {
+		cancel()
+		delete(vs.activeTTS, channel)
+	}
+	vs.ttsMu.Unlock()
 }
 
 // followupWindow is how long Orca waits for a query after a bare
@@ -220,8 +271,11 @@ func (vs *voiceSubsystem) handleUtterance(ctx context.Context, channel, speaker 
 	// Wake-only utterance ("Hey Orca" with nothing else): play an
 	// acknowledgement tone and arm a 10 s follow-up window so the
 	// speaker can talk again WITHOUT having to say "Hey Orca" first.
+	// Also barge-in: silence any in-flight TTS immediately so the
+	// user doesn't have to wait for Orca to finish before being heard.
 	if matched && (query == "" || query == "(Acknowledge briefly that you're here.)") {
 		log.Printf("[orca/voice] %s/%s: wake-only -> ack + listen window", channel, speaker)
+		vs.cancelTTS(channel)
 		vs.armFollowup(channel, speaker)
 		vs.playAck(ctx, channel)
 		return
@@ -241,6 +295,11 @@ func (vs *voiceSubsystem) handleUtterance(ctx context.Context, channel, speaker 
 	// Any real query consumes any pending follow-up window for this
 	// speaker, so a subsequent unrelated utterance doesn't get caught.
 	vs.consumeFollowup(channel, speaker)
+
+	// Barge-in: silence any prior in-flight TTS so the LLM round-trip
+	// for THIS new ask can land on a quiet channel. The next Speak
+	// call will arm a fresh TTS context.
+	vs.cancelTTS(channel)
 
 	answer, err := vs.askPlain(ctx, channel, speaker, query)
 	if err != nil {
@@ -273,7 +332,11 @@ func (vs *voiceSubsystem) handleUtterance(ctx context.Context, channel, speaker 
 	}
 	log.Printf("[orca/voice] %s: tts ok mime=%s bytes=%d head=%q",
 		channel, mime, len(audio), truncate(string(audio), 64))
-	if serr := vs.tap.Speak(ctx, channel, audio, mime); serr != nil {
+	// Arm a cancellable TTS context: a subsequent wake utterance for
+	// this channel will fire cancelTTS to cut the playback short.
+	speakCtx := vs.armTTS(ctx, channel)
+	defer vs.disarmTTS(channel, speakCtx)
+	if serr := vs.tap.Speak(speakCtx, channel, audio, mime); serr != nil {
 		log.Printf("[orca/voice] %s: speak: %v", channel, serr)
 	}
 }

@@ -171,7 +171,7 @@ func (t *localTap) Speak(ctx context.Context, channel string, audio []byte, mime
 	t.mu.Unlock()
 	peer.BroadcastSpeaking()
 	defer peer.BroadcastSilent()
-	return speakOpus(peer, audio, mime, enc, pktr)
+	return speakOpus(ctx, peer, audio, mime, enc, pktr)
 }
 
 // silenceRMS is the squared-amplitude threshold that marks a frame as
@@ -339,7 +339,7 @@ func int16ToBytes(samples []int16) []byte {
 // been idle since the previous reply. Standard WebRTC TTS hygiene.
 const preambleSilenceFrames = 10
 
-func speakOpus(peer LocalPeer, audio []byte, mime string, enc *OpusEncoder, pktr *RTPPacketizer) error {
+func speakOpus(ctx context.Context, peer LocalPeer, audio []byte, mime string, enc *OpusEncoder, pktr *RTPPacketizer) error {
 	var pcm []int16
 	var srcRate, srcChannels int
 	mime = strings.ToLower(mime)
@@ -377,10 +377,12 @@ func speakOpus(peer LocalPeer, audio []byte, mime string, enc *OpusEncoder, pktr
 
 	deadline := time.Now()
 	for off := 0; off < len(pcm); off += frameSize {
+		if err := ctx.Err(); err != nil {
+			// Barge-in / channel-leave / shutdown.
+			return err
+		}
 		end := off + frameSize
 		if end > len(pcm) {
-			// Pad the trailing partial frame with zeros so the encoder
-			// gets a full frame and we don't truncate the tail.
 			padded := make([]int16, frameSize)
 			copy(padded, pcm[off:])
 			payload, eerr := enc.EncodeFrame(padded)
@@ -407,14 +409,14 @@ func speakOpus(peer LocalPeer, audio []byte, mime string, enc *OpusEncoder, pktr
 		if serr := peer.SendOpus(rtpBytes); serr != nil {
 			return serr
 		}
-		// Real-time pacing: keep TTS playback at 1x speed instead of
-		// flooding the SFU with a burst.
 		deadline = deadline.Add(frameInterval)
 		if d := time.Until(deadline); d > 0 {
-			time.Sleep(d)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(d):
+			}
 		} else {
-			// Slipped a frame; reset the deadline to now so we don't
-			// chase an ever-widening backlog if the encoder stalls.
 			deadline = time.Now()
 		}
 	}
