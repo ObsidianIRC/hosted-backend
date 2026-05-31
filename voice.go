@@ -571,13 +571,20 @@ func (m *voiceManager) handleJoin(nick, channel, account string) {
 		peer.subSenders[track.ID()] = s
 		peer.mu.Unlock()
 	}
-	// Local peers broadcast their mic-on state at registration time,
-	// which is BEFORE any client is in the room, so new joiners
-	// default to "muted" in the UI. Re-broadcast each local peer's
-	// presence{mic:on} now that this new peer is a channel member
-	// and can actually receive it.
+	// Local peers broadcast mic-on at registration time, which is
+	// BEFORE any client is in the room. New joiners would therefore
+	// see them as muted in the UI. Send mic-on DIRECTLY to the new
+	// joiner (not broadcast) so it arrives in order AFTER the joined
+	// envelope -- broadcasts can race with onJoined, which rebuilds
+	// the members map from blank and clobbers any prior state.
 	for _, lp := range localPeers {
-		lp.BroadcastMicOn()
+		m.send(nick, signalEnvelope{
+			Type:    "presence",
+			Member:  lp.nick,
+			State:   "on",
+			Kind:    "mic",
+			Channel: channel,
+		})
 	}
 
 	// Hook ICE candidate emission so we relay them back to the client.

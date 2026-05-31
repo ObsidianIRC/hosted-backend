@@ -155,10 +155,11 @@ func (lp *voiceLocalPeer) BroadcastMicOn() {
 	})
 }
 
-// BroadcastSpeaking emits a presence{Kind:"speaking"} for this local
+// BroadcastSpeaking emits a presence{State:"speaking"} for this local
 // peer; call when an outbound TTS reply starts streaming so remote
 // clients' activity indicators light up. Pair with BroadcastSilent
-// when the reply finishes.
+// when the reply finishes. The client matches on State (not Kind)
+// for speaking/silent -- see applyPresence in voice.ts.
 func (lp *voiceLocalPeer) BroadcastSpeaking() {
 	if lp == nil || lp.mgr == nil || lp.room == nil {
 		return
@@ -166,7 +167,7 @@ func (lp *voiceLocalPeer) BroadcastSpeaking() {
 	lp.mgr.broadcast(lp.room.name, "", signalEnvelope{
 		Type:    "presence",
 		Member:  lp.nick,
-		Kind:    "speaking",
+		State:   "speaking",
 		Channel: lp.room.name,
 	})
 }
@@ -178,7 +179,7 @@ func (lp *voiceLocalPeer) BroadcastSilent() {
 	lp.mgr.broadcast(lp.room.name, "", signalEnvelope{
 		Type:    "presence",
 		Member:  lp.nick,
-		Kind:    "silent",
+		State:   "silent",
 		Channel: lp.room.name,
 	})
 }
