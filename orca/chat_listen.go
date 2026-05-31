@@ -67,7 +67,11 @@ func newAddressMatcher(nick string) *addressMatcher {
 	q := regexp.QuoteMeta(nick)
 	return &addressMatcher{
 		nick:     nick,
-		startRe:  regexp.MustCompile(`(?i)^[\s@]*(?:hey|hi|hello|ok|okay|yo|hej|salut|hola|ciao|oi|olá|привет|hai|あの|ねえ|なあ|嗨|喂|你好)?[\s,]*@?` + q + `\b[\s,.:;!?\-—–]+(.*)$`),
+		// Match: optional @, optional polite prefix word, the bot nick, then
+		// either end-of-string (bare ping) or a delimiter run + the rest.
+		// The (?:...)? around the trailing piece is what lets "Hey Orca"
+		// and bare "Orca" match without requiring trailing punctuation.
+		startRe:  regexp.MustCompile(`(?i)^[\s@]*(?:hey|hi|hello|ok|okay|yo|hej|salut|hola|ciao|oi|olá|привет|hai|あの|ねえ|なあ|嗨|喂|你好)?[\s,]*@?` + q + `\b(?:[\s,.:;!?\-—–]+(.*))?$`),
 		inlineRe: regexp.MustCompile(`(?i)\B@` + q + `\b[\s,.:;!?\-—–]*`),
 		bareRe:   regexp.MustCompile(`(?i)\b` + q + `\b`),
 	}
