@@ -106,8 +106,8 @@ func (vs *voiceSubsystem) disarmTTS(channel string, ctx context.Context) {
 }
 
 // summarizeChatError extracts a short human-readable phrase from a
-// chat-provider error. The full err is usually a giant JSON blob from
-// Pollinations/Azure; we just want one line for the channel.
+// chat-provider error. The full err is usually a giant JSON blob; we
+// just want one provider-agnostic line for the channel.
 func summarizeChatError(err error) string {
 	if err == nil {
 		return "unknown error"
@@ -115,13 +115,20 @@ func summarizeChatError(err error) string {
 	s := err.Error()
 	low := strings.ToLower(s)
 	switch {
-	case strings.Contains(low, "402") || strings.Contains(low, "payment required") || strings.Contains(low, "insufficient balance"):
-		return "out of pollen, top up Pollinations to continue"
+	case strings.Contains(low, "insufficient balance") ||
+		strings.Contains(low, "no resource package") ||
+		strings.Contains(low, "402") ||
+		strings.Contains(low, "payment required") ||
+		strings.Contains(low, "quota") ||
+		strings.Contains(low, "billing"):
+		return "chat provider says balance is depleted -- recharge needed"
+	case strings.Contains(low, "401") || strings.Contains(low, "unauthor") || strings.Contains(low, "invalid api key"):
+		return "chat provider auth failed -- check API key"
 	case strings.Contains(low, "429") || strings.Contains(low, "rate"):
 		return "rate-limited, try again in a moment"
 	case strings.Contains(low, "timeout") || strings.Contains(low, "deadline"):
 		return "model timed out"
-	case strings.Contains(low, "5") && strings.Contains(low, "00 "):
+	case strings.Contains(low, " 5") && strings.Contains(low, "00 "):
 		return "upstream model error"
 	}
 	return truncate(s, 120)
