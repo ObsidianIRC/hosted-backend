@@ -24,6 +24,20 @@ type SendMessageD struct {
 	IsNotice bool   `json:"is_notice,omitempty"`
 }
 
+// MessageCreate is the inbound MESSAGE_CREATE dispatch a bot receives
+// for every channel message in any channel it sits in (except its
+// own). content is the raw message text; mention_bot is a coarse
+// strstr(nick) hit set by the server side.
+type MessageCreate struct {
+	Msgid      string         `json:"msgid"`
+	Channel    map[string]any `json:"channel"`
+	Author     map[string]any `json:"author"`
+	Content    string         `json:"content"`
+	IsNotice   bool           `json:"is_notice"`
+	IsTagmsg   bool           `json:"is_tagmsg"`
+	MentionBot bool           `json:"mention_bot"`
+}
+
 type Frame struct {
 	Op   int             `json:"op"`
 	Seq  int64           `json:"s,omitempty"`

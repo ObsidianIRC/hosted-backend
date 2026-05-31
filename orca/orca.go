@@ -40,6 +40,11 @@ type Orca struct {
 	// into a channel outside any active invocation.
 	gwMu sync.RWMutex
 	gw   *bot.Gateway
+
+	// Lazily-built matcher for "is this channel message addressed to
+	// me?" -- cached because the nick can't change in one session.
+	addrMu      sync.Mutex
+	addrMatcher *addressMatcher
 }
 
 // SetGateway implements bot.GatewayAware; called by the gateway when
@@ -135,6 +140,13 @@ func (o *Orca) OnEvent(ctx context.Context, eventName string, data json.RawMessa
 			contentStr = string(wa.Content)
 		}
 		o.logger.AppendAction(wa.WID, wa.Action, wa.Target, wa.From.Nick, contentStr)
+	case "MESSAGE_CREATE":
+		var m bot.MessageCreate
+		if err := json.Unmarshal(data, &m); err != nil {
+			log.Printf("[orca] bad MESSAGE_CREATE: %v", err)
+			return
+		}
+		o.handleChannelMessage(ctx, m)
 	}
 }
 
