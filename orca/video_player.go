@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"sync"
@@ -24,7 +25,8 @@ const (
 	vp8ClockRate    = 90000
 	vp8MTU          = 1200 // safe RTP payload size after IP/UDP headers
 	videoFrameHz    = 30
-	videoMaxSeconds = 600  // 10-minute hard cap
+	videoMaxSeconds = 600        // 10-minute hard cap on playback
+	videoMaxBytes   = 100 << 20  // 100 MB hard cap on download size
 )
 
 // videoPlayer manages one in-flight ffmpeg pipeline for a channel.
@@ -118,11 +120,20 @@ func (vs *voiceSubsystem) stopVideo(channel string) bool {
 	return true
 }
 
-// runVideoPipeline spawns one ffmpeg that demuxes the URL into VP8
-// (on stdout, IVF format) + 48 kHz stereo s16le PCM (on fd 3 via
-// ExtraFiles). Two reader goroutines packetize each stream into RTP
-// and write through the persistent encoder/packetizer per peer.
+// runVideoPipeline downloads the URL to a tempfile (so ffmpeg can
+// seek -- many .mp4s have the moov atom at end-of-file, and ffmpeg's
+// built-in HTTPS reader chokes on HTTP/2 anyway), then spawns one
+// ffmpeg that demuxes it into VP8 (on stdout, IVF format) + 48 kHz
+// stereo s16le PCM (on fd 3 via ExtraFiles). Two reader goroutines
+// packetize each stream into RTP.
 func (vs *voiceSubsystem) runVideoPipeline(ctx context.Context, channel, url string, peer LocalPeer) error {
+	tmpPath, err := downloadVideoToTemp(ctx, url)
+	if err != nil {
+		return fmt.Errorf("download: %w", err)
+	}
+	defer os.Remove(tmpPath)
+	log.Printf("[orca/video] %s: downloaded %s to %s", channel, url, tmpPath)
+
 	audioR, audioW, err := os.Pipe()
 	if err != nil {
 		return fmt.Errorf("pipe: %w", err)
@@ -133,7 +144,7 @@ func (vs *voiceSubsystem) runVideoPipeline(ctx context.Context, channel, url str
 		"-hide_banner",
 		"-loglevel", "error",
 		"-nostdin",
-		"-i", url,
+		"-i", tmpPath,
 		// Video output: VP8 in IVF on stdout. Scale to 640x360 and cap
 		// to 30 fps so per-frame size stays small and pacing is sane.
 		"-an",
@@ -227,6 +238,49 @@ func (vs *voiceSubsystem) runVideoPipeline(ctx context.Context, channel, url str
 	wg.Wait()
 	_ = cmd.Wait()
 	return nil
+}
+
+// downloadVideoToTemp fetches the URL into a fresh tempfile and
+// returns the path. Caller is responsible for os.Remove. Uses Go's
+// http.Client (HTTP/2-savvy) instead of ffmpeg's built-in HTTPS
+// reader, which has trouble with some H/2 servers and with .mp4
+// files where the moov atom lives at the end.
+func downloadVideoToTemp(ctx context.Context, url string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "obbyircd-orca/0.1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return "", fmt.Errorf("http %s", resp.Status)
+	}
+	tmp, err := os.CreateTemp("", "orca-video-*.bin")
+	if err != nil {
+		return "", err
+	}
+	// Cap at videoMaxBytes to bound disk + processing cost.
+	written, err := io.Copy(tmp, io.LimitReader(resp.Body, videoMaxBytes+1))
+	if cerr := tmp.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		os.Remove(tmp.Name())
+		return "", fmt.Errorf("write: %w", err)
+	}
+	if written > videoMaxBytes {
+		os.Remove(tmp.Name())
+		return "", fmt.Errorf("video too large (>%d bytes)", videoMaxBytes)
+	}
+	if written == 0 {
+		os.Remove(tmp.Name())
+		return "", fmt.Errorf("empty response body")
+	}
+	return tmp.Name(), nil
 }
 
 // ----- IVF reader + VP8 RTP packetizer -----------------------------
