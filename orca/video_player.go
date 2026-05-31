@@ -120,12 +120,10 @@ func (vs *voiceSubsystem) stopVideo(channel string) bool {
 	return true
 }
 
-// runVideoPipeline downloads the URL to a tempfile (so ffmpeg can
-// seek -- many .mp4s have the moov atom at end-of-file, and ffmpeg's
-// built-in HTTPS reader chokes on HTTP/2 anyway), then spawns one
-// ffmpeg that demuxes it into VP8 (on stdout, IVF format) + 48 kHz
-// stereo s16le PCM (on fd 3 via ExtraFiles). Two reader goroutines
-// packetize each stream into RTP.
+// runVideoPipeline is the dispatcher: download the URL, detect whether
+// it's an image or video, then run the appropriate ffmpeg invocation.
+// Static images are looped as a low-fps still until stop or the
+// duration cap; videos are demuxed normally with audio.
 func (vs *voiceSubsystem) runVideoPipeline(ctx context.Context, channel, url string, peer LocalPeer) error {
 	tmpPath, err := downloadVideoToTemp(ctx, url)
 	if err != nil {
@@ -134,6 +132,67 @@ func (vs *voiceSubsystem) runVideoPipeline(ctx context.Context, channel, url str
 	defer os.Remove(tmpPath)
 	log.Printf("[orca/video] %s: downloaded %s to %s", channel, url, tmpPath)
 
+	isImg, err := isImageFile(tmpPath)
+	if err != nil {
+		return fmt.Errorf("sniff: %w", err)
+	}
+	if isImg {
+		log.Printf("[orca/video] %s: input is a still image -- looping", channel)
+		return vs.runImagePipeline(ctx, channel, tmpPath, peer)
+	}
+	return vs.runVideoFilePipeline(ctx, channel, tmpPath, peer)
+}
+
+// runImagePipeline shows a single still image on Orca's video feed
+// until ctx expires (or videoMaxSeconds is hit). ffmpeg's image2
+// demuxer with -loop 1 produces an endless stream of decoded frames;
+// we encode VP8 at 2 fps (image isn't moving) to keep CPU low. No
+// audio output because images have none.
+func (vs *voiceSubsystem) runImagePipeline(ctx context.Context, channel, imgPath string, peer LocalPeer) error {
+	cmd := exec.CommandContext(ctx, "ffmpeg",
+		"-hide_banner",
+		"-loglevel", "error",
+		"-nostdin",
+		"-loop", "1",
+		"-framerate", "2",
+		"-i", imgPath,
+		// Letterbox-scale to 640x360 preserving the image's aspect.
+		"-vf", "scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2:color=black,fps=2",
+		"-c:v", "libvpx",
+		"-b:v", "200k",
+		"-cpu-used", "8",
+		"-deadline", "realtime",
+		"-auto-alt-ref", "0",
+		"-g", "60",
+		"-keyint_min", "60",
+		"-t", fmt.Sprintf("%d", videoMaxSeconds),
+		"-f", "ivf", "pipe:1",
+	)
+	cmd.Stderr = os.Stderr
+
+	videoStdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("stdout pipe: %w", err)
+	}
+
+	log.Printf("[orca/video] %s: spawning ffmpeg (image) for %s", channel, imgPath)
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("ffmpeg start: %w", err)
+	}
+
+	videoPktr := newVP8Packetizer(NextSSRC())
+	if err := pumpVideoIVF(ctx, videoStdout, peer, videoPktr); err != nil && !errors.Is(err, io.EOF) {
+		log.Printf("[orca/video] %s: video pump: %v", channel, err)
+	}
+	_ = cmd.Wait()
+	return nil
+}
+
+// runVideoFilePipeline spawns one ffmpeg that demuxes the local
+// tempfile into VP8 (on stdout, IVF format) + 48 kHz stereo s16le
+// PCM (on fd 3 via ExtraFiles). Two reader goroutines packetize
+// each stream into RTP.
+func (vs *voiceSubsystem) runVideoFilePipeline(ctx context.Context, channel, videoPath string, peer LocalPeer) error {
 	audioR, audioW, err := os.Pipe()
 	if err != nil {
 		return fmt.Errorf("pipe: %w", err)
@@ -144,7 +203,7 @@ func (vs *voiceSubsystem) runVideoPipeline(ctx context.Context, channel, url str
 		"-hide_banner",
 		"-loglevel", "error",
 		"-nostdin",
-		"-i", tmpPath,
+		"-i", videoPath,
 		// Video output: VP8 in IVF on stdout. Scale to 640x360 and cap
 		// to 30 fps so per-frame size stays small and pacing is sane.
 		"-an",
@@ -176,7 +235,7 @@ func (vs *voiceSubsystem) runVideoPipeline(ctx context.Context, channel, url str
 		return fmt.Errorf("stdout pipe: %w", err)
 	}
 
-	log.Printf("[orca/video] %s: spawning ffmpeg for %s", channel, url)
+	log.Printf("[orca/video] %s: spawning ffmpeg (video) for %s", channel, videoPath)
 	if err := cmd.Start(); err != nil {
 		audioW.Close()
 		return fmt.Errorf("ffmpeg start: %w", err)
@@ -185,10 +244,6 @@ func (vs *voiceSubsystem) runVideoPipeline(ctx context.Context, channel, url str
 	// when the child exits. Child kept its dup via ExtraFiles.
 	_ = audioW.Close()
 
-	// Pull the persistent encoder + packetizers for this channel from
-	// localTap; audio packetizer is shared with TTS so the SSRC stays
-	// stable. Video gets its own packetizer (fresh SSRC) the first time
-	// it's used per channel.
 	tap, _ := vs.tap.(*localTap)
 	tap.mu.Lock()
 	if tap.pktrs == nil {
@@ -219,8 +274,6 @@ func (vs *voiceSubsystem) runVideoPipeline(ctx context.Context, channel, url str
 	peer.BroadcastSpeaking()
 	defer peer.BroadcastSilent()
 
-	// Run both pumps. The first to return (or ctx cancel) tears down
-	// the rest by killing ffmpeg, which fires EOF on the other pipe.
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
@@ -238,6 +291,23 @@ func (vs *voiceSubsystem) runVideoPipeline(ctx context.Context, channel, url str
 	wg.Wait()
 	_ = cmd.Wait()
 	return nil
+}
+
+// isImageFile sniffs the first 512 bytes of the file and returns
+// true for image MIME types (png/jpeg/gif/webp/bmp/etc).
+func isImageFile(path string) (bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	var head [512]byte
+	n, _ := io.ReadFull(f, head[:])
+	if n == 0 {
+		return false, fmt.Errorf("empty file")
+	}
+	ct := http.DetectContentType(head[:n])
+	return len(ct) >= 6 && ct[:6] == "image/", nil
 }
 
 // downloadVideoToTemp fetches the URL into a fresh tempfile and

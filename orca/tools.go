@@ -199,10 +199,10 @@ func (o *Orca) registerDefaultTools() {
 
 	o.registerTool(Tool{
 		Name:        "play_video",
-		Description: "Play a video by URL on Orca's video feed in a voice channel. Use the same voice channel the user is currently in. Audio + video are transcoded via ffmpeg and streamed to all participants. Preempts any previously playing video. Stops automatically after 10 minutes or when stop_video is called.",
+		Description: "Display a video OR a static image by URL on Orca's video feed in a voice channel. Use the same voice channel the user is currently in. Videos play with audio; images are shown looped as a still frame until stop_video is called or the 10-minute cap is hit. Accepts PNG, JPEG, GIF, WebP, and any video format ffmpeg understands. Preempts any previously playing media in the same channel.",
 		Parameters: objectSchema(
 			prop("channel", "string", "Voice channel to play in (e.g. ^vc-opers). Use the channel the speaker is in."),
-			prop("url", "string", "HTTP(S) URL of the video to play."),
+			prop("url", "string", "HTTP(S) URL of the video or image to display."),
 		).required("channel", "url").build(),
 		Handler: toolPlayVideo,
 	})
