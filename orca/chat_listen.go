@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"regexp"
 	"strings"
 	"time"
+	"unicode"
 
 	"backend/ai"
 	"backend/bot"
@@ -32,62 +32,38 @@ func chatListenEnabled() bool {
 const chatToolBudget = 4
 
 // addressMatcher decides whether a channel message is targeted at the
-// bot, and if so what the residual query is.
+// bot. Rule (per user request, simpler and more reliable than regex
+// gymnastics): after stripping all punctuation to spaces, the nick
+// must be either the FIRST or SECOND word of the message. Anywhere
+// else and we ignore -- avoids false positives like "did you see the
+// movie about Orca" or "thanks orca", and forces deliberate addressing.
 //
-// Match rules (case-insensitive, all checked):
+// Examples that MATCH:
+//   "Orca" / "Orca?" / "Orca, what time?"     (1st word)
+//   "Hey Orca, what?" / "@Orca explain" / "OK Orca do X"   (2nd word)
 //
-//   1. Starts with optional polite prefix + nick: "hey orca, ..." /
-//      "okay orca - ..." / "orca: ..." / "@orca ..."
-//   2. @nick mention anywhere: "could you @orca explain this" -> "could
-//      you explain this"
-//   3. Bare nick mention with a question elsewhere: "is orca around?"
-//      -> the whole sentence becomes the query
-//
-// Designed to be permissive about punctuation (Whisper-style commas
-// /periods between words) and language-agnostic where the bot's nick
-// is the anchor token. For free-form polite prefixes ("could you
-// please"), we don't care because rule (1) doesn't require them.
+// Examples that DON'T match:
+//   "did you see that movie about Orca"
+//   "talk about Orca it wouldn't care?"
+//   "are you there orca?"   (4th word -- ask "orca, are you there?" instead)
+//   "I love orca whales"
 type addressMatcher struct {
-	nick string
-	// startRe matches a leading polite-prefix + nick + delimiter.
-	// Capture group 1 is everything after.
-	startRe *regexp.Regexp
-	// inlineRe matches an @-mention anywhere in the message.
-	inlineRe *regexp.Regexp
-	// endRe matches the nick at the end of the message (only
-	// followed by punctuation/whitespace).
-	endRe *regexp.Regexp
+	nick      string
+	nickLower string
 }
 
 func newAddressMatcher(nick string) *addressMatcher {
-	if nick == "" {
-		return &addressMatcher{nick: nick}
-	}
-	// Quote so regex specials in nick (unlikely but possible) don't
-	// blow up. Word-boundary works fine for letter/digit nicks.
-	q := regexp.QuoteMeta(nick)
 	return &addressMatcher{
-		nick:     nick,
-		// Match: optional @, optional polite prefix word, the bot nick, then
-		// either end-of-string (bare ping) or a delimiter run + the rest.
-		// The (?:...)? around the trailing piece is what lets "Hey Orca"
-		// and bare "Orca" match without requiring trailing punctuation.
-		startRe:  regexp.MustCompile(`(?i)^[\s@]*(?:hey|hi|hello|ok|okay|yo|hej|salut|hola|ciao|oi|olá|привет|hai|あの|ねえ|なあ|嗨|喂|你好)?[\s,]*@?` + q + `\b(?:[\s,.:;!?\-—–]+(.*))?$`),
-		inlineRe: regexp.MustCompile(`(?i)\B@` + q + `\b[\s,.:;!?\-—–]*`),
-		// endRe matches only when the nick is the last meaningful token
-		// (followed by nothing but punctuation/whitespace until end).
-		// This catches "are you there orca?" / "thanks orca!" without
-		// triggering on "talking about orca it wouldn't care?" where
-		// the nick is buried mid-sentence and there's more text after.
-		endRe: regexp.MustCompile(`(?i)\b` + q + `[\s,.:;!?\-—–]*$`),
+		nick:      nick,
+		nickLower: strings.ToLower(nick),
 	}
 }
 
 // match returns (addressed, query). If addressed=false, the message
-// isn't for us. Query is the text to feed to the LLM with the bot's
-// own name stripped where possible.
+// isn't for us. Query is the residual text after the addressing
+// prefix is stripped; empty query means a bare ping like "Orca?".
 func (m *addressMatcher) match(text string) (bool, string) {
-	if m.nick == "" || m.startRe == nil {
+	if m.nick == "" {
 		return false, ""
 	}
 	t := strings.TrimSpace(text)
@@ -95,34 +71,45 @@ func (m *addressMatcher) match(text string) (bool, string) {
 		return false, ""
 	}
 
-	// 1. Leading address.
-	if sub := m.startRe.FindStringSubmatch(t); sub != nil {
-		rest := strings.TrimSpace(sub[1])
-		if rest == "" {
-			// e.g. just "Orca?" or "hey orca!" -- treat as a ping.
-			return true, "(Acknowledge briefly that you're here.)"
+	tokens := tokenizeStrippingPunct(t)
+	if len(tokens) == 0 {
+		return false, ""
+	}
+
+	idx := -1
+	if strings.ToLower(tokens[0]) == m.nickLower {
+		idx = 0
+	} else if len(tokens) > 1 && strings.ToLower(tokens[1]) == m.nickLower {
+		idx = 1
+	}
+	if idx == -1 {
+		return false, ""
+	}
+
+	rest := strings.TrimSpace(strings.Join(tokens[idx+1:], " "))
+	if rest == "" {
+		// e.g. just "Orca?" or "Hey Orca" -- treat as a ping.
+		return true, "(Acknowledge briefly that you're here.)"
+	}
+	return true, rest
+}
+
+// tokenizeStrippingPunct turns the message into whitespace-separated
+// tokens with every non-letter/non-digit character treated as a word
+// separator. So "Hey, Orca!" -> ["Hey", "Orca"], "@orca foo" -> ["orca",
+// "foo"], "isn't" -> ["isn", "t"] (good enough -- we only look at the
+// first two tokens).
+func tokenizeStrippingPunct(s string) []string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if unicode.IsLetter(r) || unicode.IsDigit(r) {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune(' ')
 		}
-		return true, rest
 	}
-
-	// 2. Inline @mention -- strip it and run the rest.
-	if m.inlineRe.MatchString(t) {
-		cleaned := strings.TrimSpace(m.inlineRe.ReplaceAllString(t, " "))
-		if cleaned == "" {
-			return true, "(Acknowledge briefly that you're here.)"
-		}
-		return true, cleaned
-	}
-
-	// 3. Nick at the very end of the message -- "are you there orca?",
-	//    "thanks orca!", "where's orca". End-anchored so statements that
-	//    merely mention the nick mid-sentence and happen to end with ?
-	//    ("if I talk about orca, wouldn't it care?") don't trigger.
-	if m.endRe.MatchString(t) {
-		return true, t
-	}
-
-	return false, ""
+	return strings.Fields(b.String())
 }
 
 // handleChannelMessage is the dispatch entry from OnEvent. Filters out
