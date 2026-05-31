@@ -62,7 +62,24 @@ func (vs *voiceSubsystem) playVideo(parentCtx context.Context, channel, url stri
 		return fmt.Errorf("not joined to %s", channel)
 	}
 
-	// Preempt any in-flight playback for this channel.
+	// Synchronous download + image-vs-video sniff: any URL error
+	// (404, DNS, oversized, etc.) surfaces directly to the caller so
+	// the LLM can tell the user "the URL is broken" rather than
+	// reporting success and silently swallowing the failure.
+	dlCtx, dlCancel := context.WithTimeout(parentCtx, 30*time.Second)
+	tmpPath, err := downloadVideoToTemp(dlCtx, url)
+	dlCancel()
+	if err != nil {
+		return fmt.Errorf("download: %w", err)
+	}
+	isImg, err := isImageFile(tmpPath)
+	if err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("sniff: %w", err)
+	}
+
+	// Preempt any in-flight playback only AFTER we know the download
+	// is good -- a 404 shouldn't kill a currently-playing video.
 	vs.stopVideo(channel)
 
 	ctx, cancel := context.WithTimeout(parentCtx, videoMaxSeconds*time.Second)
@@ -82,6 +99,7 @@ func (vs *voiceSubsystem) playVideo(parentCtx context.Context, channel, url stri
 	go func() {
 		defer close(player.done)
 		defer cancel()
+		defer os.Remove(tmpPath)
 		defer func() {
 			vs.videoMu.Lock()
 			if vs.activeVideo[channel] == player {
@@ -89,8 +107,16 @@ func (vs *voiceSubsystem) playVideo(parentCtx context.Context, channel, url stri
 			}
 			vs.videoMu.Unlock()
 		}()
-		if err := vs.runVideoPipeline(ctx, channel, url, peer); err != nil {
-			log.Printf("[orca/video] %s: playback ended: %v", channel, err)
+		log.Printf("[orca/video] %s: downloaded %s to %s (image=%v)",
+			channel, url, tmpPath, isImg)
+		var perr error
+		if isImg {
+			perr = vs.runImagePipeline(ctx, channel, tmpPath, peer)
+		} else {
+			perr = vs.runVideoFilePipeline(ctx, channel, tmpPath, peer)
+		}
+		if perr != nil {
+			log.Printf("[orca/video] %s: playback ended: %v", channel, perr)
 		} else {
 			log.Printf("[orca/video] %s: playback finished cleanly", channel)
 		}
@@ -118,29 +144,6 @@ func (vs *voiceSubsystem) stopVideo(channel string) bool {
 		// drop the handle and move on.
 	}
 	return true
-}
-
-// runVideoPipeline is the dispatcher: download the URL, detect whether
-// it's an image or video, then run the appropriate ffmpeg invocation.
-// Static images are looped as a low-fps still until stop or the
-// duration cap; videos are demuxed normally with audio.
-func (vs *voiceSubsystem) runVideoPipeline(ctx context.Context, channel, url string, peer LocalPeer) error {
-	tmpPath, err := downloadVideoToTemp(ctx, url)
-	if err != nil {
-		return fmt.Errorf("download: %w", err)
-	}
-	defer os.Remove(tmpPath)
-	log.Printf("[orca/video] %s: downloaded %s to %s", channel, url, tmpPath)
-
-	isImg, err := isImageFile(tmpPath)
-	if err != nil {
-		return fmt.Errorf("sniff: %w", err)
-	}
-	if isImg {
-		log.Printf("[orca/video] %s: input is a still image -- looping", channel)
-		return vs.runImagePipeline(ctx, channel, tmpPath, peer)
-	}
-	return vs.runVideoFilePipeline(ctx, channel, tmpPath, peer)
 }
 
 // runImagePipeline shows a single still image on Orca's video feed
