@@ -54,8 +54,9 @@ type addressMatcher struct {
 	startRe *regexp.Regexp
 	// inlineRe matches an @-mention anywhere in the message.
 	inlineRe *regexp.Regexp
-	// bareRe matches the nick anywhere as a standalone token.
-	bareRe *regexp.Regexp
+	// endRe matches the nick at the end of the message (only
+	// followed by punctuation/whitespace).
+	endRe *regexp.Regexp
 }
 
 func newAddressMatcher(nick string) *addressMatcher {
@@ -73,7 +74,12 @@ func newAddressMatcher(nick string) *addressMatcher {
 		// and bare "Orca" match without requiring trailing punctuation.
 		startRe:  regexp.MustCompile(`(?i)^[\s@]*(?:hey|hi|hello|ok|okay|yo|hej|salut|hola|ciao|oi|olá|привет|hai|あの|ねえ|なあ|嗨|喂|你好)?[\s,]*@?` + q + `\b(?:[\s,.:;!?\-—–]+(.*))?$`),
 		inlineRe: regexp.MustCompile(`(?i)\B@` + q + `\b[\s,.:;!?\-—–]*`),
-		bareRe:   regexp.MustCompile(`(?i)\b` + q + `\b`),
+		// endRe matches only when the nick is the last meaningful token
+		// (followed by nothing but punctuation/whitespace until end).
+		// This catches "are you there orca?" / "thanks orca!" without
+		// triggering on "talking about orca it wouldn't care?" where
+		// the nick is buried mid-sentence and there's more text after.
+		endRe: regexp.MustCompile(`(?i)\b` + q + `[\s,.:;!?\-—–]*$`),
 	}
 }
 
@@ -108,11 +114,11 @@ func (m *addressMatcher) match(text string) (bool, string) {
 		return true, cleaned
 	}
 
-	// 3. Bare nick mention + question mark anywhere -> probably a
-	//    question addressed to us. Conservative: also require the
-	//    message to end with "?" so "I saw orca yesterday" doesn't
-	//    trigger.
-	if strings.HasSuffix(t, "?") && m.bareRe.MatchString(t) {
+	// 3. Nick at the very end of the message -- "are you there orca?",
+	//    "thanks orca!", "where's orca". End-anchored so statements that
+	//    merely mention the nick mid-sentence and happen to end with ?
+	//    ("if I talk about orca, wouldn't it care?") don't trigger.
+	if m.endRe.MatchString(t) {
 		return true, t
 	}
 
