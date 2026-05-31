@@ -43,11 +43,31 @@ type localTap struct {
 	api  LocalParticipantAPI
 	nick string
 
-	mu     sync.Mutex
-	peers  map[string]LocalPeer        // channel -> registered local peer
-	frames map[string]chan AudioFrame  // channel -> outbound to Orca's loop
-	pktrs  map[string]*RTPPacketizer   // channel -> persistent RTP packetizer
-	encs   map[string]*OpusEncoder     // channel -> persistent Opus encoder
+	mu        sync.Mutex
+	peers     map[string]LocalPeer         // channel -> registered local peer
+	frames    map[string]chan AudioFrame   // channel -> outbound to Orca's loop
+	pktrs     map[string]*RTPPacketizer    // channel -> persistent Opus packetizer
+	encs      map[string]*OpusEncoder      // channel -> persistent Opus encoder
+	videoPktrs map[string]*vp8Packetizer   // channel -> persistent VP8 packetizer
+}
+
+// videoPacketizerFor returns the persistent VP8 packetizer for the
+// given channel, creating it on first use. One SSRC per channel for
+// the lifetime of the local peer, so consecutive plays don't trip the
+// client's "new audio/video source" jitter-buffer warmup that loses
+// the opening frames of each play.
+func (t *localTap) videoPacketizerFor(channel string) *vp8Packetizer {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.videoPktrs == nil {
+		t.videoPktrs = map[string]*vp8Packetizer{}
+	}
+	p := t.videoPktrs[channel]
+	if p == nil {
+		p = newVP8Packetizer(NextSSRC())
+		t.videoPktrs[channel] = p
+	}
+	return p
 }
 
 func NewLocalTap(api LocalParticipantAPI, nick string) VoiceTap {
@@ -105,6 +125,7 @@ func (t *localTap) Leave(ctx context.Context, channel string) error {
 	}
 	delete(t.pktrs, channel)
 	delete(t.encs, channel)
+	delete(t.videoPktrs, channel)
 	t.mu.Unlock()
 	if peer != nil {
 		return peer.Stop()

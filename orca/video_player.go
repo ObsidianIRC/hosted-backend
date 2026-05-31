@@ -187,7 +187,11 @@ func (vs *voiceSubsystem) runImagePipeline(ctx context.Context, channel, imgPath
 		return fmt.Errorf("ffmpeg start: %w", err)
 	}
 
-	videoPktr := newVP8Packetizer(NextSSRC())
+	// Persistent VP8 packetizer per channel: same SSRC + monotonic
+	// seq/ts across consecutive plays so the client's jitter buffer
+	// doesn't re-warmup (and drop the first frames) every new play.
+	tap, _ := vs.tap.(*localTap)
+	videoPktr := tap.videoPacketizerFor(channel)
 	if err := pumpVideoIVF(ctx, videoStdout, peer, videoPktr); err != nil && !errors.Is(err, io.EOF) {
 		log.Printf("[orca/video] %s: video pump: %v", channel, err)
 	}
@@ -276,7 +280,8 @@ func (vs *voiceSubsystem) runVideoFilePipeline(ctx context.Context, channel, vid
 		tap.encs[channel] = audioEnc
 	}
 	tap.mu.Unlock()
-	videoPktr := newVP8Packetizer(NextSSRC())
+	// Persistent VP8 packetizer per channel -- see runImagePipeline.
+	videoPktr := tap.videoPacketizerFor(channel)
 
 	peer.BroadcastSpeaking()
 	defer peer.BroadcastSilent()
