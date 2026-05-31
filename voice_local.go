@@ -108,18 +108,10 @@ func (m *voiceManager) RegisterLocal(nick, channel string, onRTP RTPCallback) (L
 		room.mu.Unlock()
 		return nil, fmt.Errorf("local-audio track: %w", terr)
 	}
-	vtrack, verr := webrtc.NewTrackLocalStaticRTP(
-		webrtc.RTPCodecCapability{
-			MimeType:  webrtc.MimeTypeVP8,
-			ClockRate: 90000,
-		},
-		fmt.Sprintf("%s-video-local", nick),
-		nick,
-	)
-	if verr != nil {
-		room.mu.Unlock()
-		return nil, fmt.Errorf("local-video track: %w", verr)
-	}
+	// Video track is created LAZILY in SendVideoRTP so participants'
+	// UIs don't permanently show a popable empty video element. Cost
+	// is one renegotiation on the first SendVideoRTP after every
+	// register; subsequent playbacks reuse the existing track.
 	lp := &voiceLocalPeer{
 		nick:     nick,
 		room:     room,
@@ -127,14 +119,12 @@ func (m *voiceManager) RegisterLocal(nick, channel string, onRTP RTPCallback) (L
 		onRTP:    onRTP,
 		joinedAt: time.Now(),
 		audio:    track,
-		video:    vtrack,
 	}
 	room.localPeers[nick] = lp
 	room.mu.Unlock()
 
-	// Push the tracks to anyone already in the room (one-time renegotiate).
+	// Push the audio track to anyone already in the room (one-time renegotiate).
 	lp.subscribeOthersToTrack(track)
-	lp.subscribeOthersToTrack(vtrack)
 
 	m.broadcast(channel, "", signalEnvelope{
 		Type:    "presence",
@@ -259,9 +249,28 @@ func (lp *voiceLocalPeer) SendVideoRTP(rtpPacket []byte) error {
 		return errors.New("local peer stopped")
 	}
 	track := lp.video
-	lp.mu.Unlock()
 	if track == nil {
-		return errors.New("local peer has no video track")
+		t, err := webrtc.NewTrackLocalStaticRTP(
+			webrtc.RTPCodecCapability{
+				MimeType:  webrtc.MimeTypeVP8,
+				ClockRate: 90000,
+			},
+			fmt.Sprintf("%s-video-local", lp.nick),
+			lp.nick,
+		)
+		if err != nil {
+			lp.mu.Unlock()
+			return fmt.Errorf("local-video track: %w", err)
+		}
+		lp.video = t
+		track = t
+		lp.mu.Unlock()
+		// Subscribe existing peers to the new track (triggers a one-
+		// time renegotiation). Done outside the lock to avoid holding
+		// it across pc.AddTrack + renegotiateFor (both can block).
+		lp.subscribeOthersToTrack(track)
+	} else {
+		lp.mu.Unlock()
 	}
 	_, err := track.Write(rtpPacket)
 	return err
