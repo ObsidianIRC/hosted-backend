@@ -162,12 +162,16 @@ func (vs *voiceSubsystem) runImagePipeline(ctx context.Context, channel, imgPath
 		// Letterbox-scale to 640x360 preserving the image's aspect.
 		"-vf", "scale=640:360:force_original_aspect_ratio=decrease,pad=640:360:(ow-iw)/2:(oh-ih)/2:color=black,fps=2",
 		"-c:v", "libvpx",
-		"-b:v", "200k",
+		"-b:v", "300k",
 		"-cpu-used", "8",
 		"-deadline", "realtime",
 		"-auto-alt-ref", "0",
-		"-g", "60",
-		"-keyint_min", "60",
+		// Every frame is a keyframe so peers that joined AFTER playback
+		// started get a complete picture on their next decode. Cheap
+		// because a static image at 2 fps compresses to a tiny keyframe.
+		"-g", "1",
+		"-keyint_min", "1",
+		"-error-resilient", "1",
 		"-t", fmt.Sprintf("%d", videoMaxSeconds),
 		"-f", "ivf", "pipe:1",
 	)
