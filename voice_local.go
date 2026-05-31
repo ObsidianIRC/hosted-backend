@@ -35,6 +35,11 @@ type LocalPeer interface {
 	// subscribed to by every existing remote peer; subsequent calls
 	// just write to it.
 	SendOpus(rtpPacket []byte) error
+	// SendVideoRTP appends a VP8 RTP packet to this peer's outbound
+	// video track. The track is created up-front at RegisterLocal
+	// (same lifecycle as audio) so first-packet renegotiation
+	// latency doesn't chop the start of the playback.
+	SendVideoRTP(rtpPacket []byte) error
 	Stop() error
 	// BroadcastSpeaking / BroadcastSilent emit presence updates so
 	// remote clients' speaker activity indicators light up while
@@ -53,6 +58,7 @@ type voiceLocalPeer struct {
 
 	mu       sync.Mutex
 	audio    *webrtc.TrackLocalStaticRTP
+	video    *webrtc.TrackLocalStaticRTP
 	stopped  bool
 }
 
@@ -102,6 +108,18 @@ func (m *voiceManager) RegisterLocal(nick, channel string, onRTP RTPCallback) (L
 		room.mu.Unlock()
 		return nil, fmt.Errorf("local-audio track: %w", terr)
 	}
+	vtrack, verr := webrtc.NewTrackLocalStaticRTP(
+		webrtc.RTPCodecCapability{
+			MimeType:  webrtc.MimeTypeVP8,
+			ClockRate: 90000,
+		},
+		fmt.Sprintf("%s-video-local", nick),
+		nick,
+	)
+	if verr != nil {
+		room.mu.Unlock()
+		return nil, fmt.Errorf("local-video track: %w", verr)
+	}
 	lp := &voiceLocalPeer{
 		nick:     nick,
 		room:     room,
@@ -109,12 +127,14 @@ func (m *voiceManager) RegisterLocal(nick, channel string, onRTP RTPCallback) (L
 		onRTP:    onRTP,
 		joinedAt: time.Now(),
 		audio:    track,
+		video:    vtrack,
 	}
 	room.localPeers[nick] = lp
 	room.mu.Unlock()
 
-	// Push the track to anyone already in the room (one-time renegotiate).
+	// Push the tracks to anyone already in the room (one-time renegotiate).
 	lp.subscribeOthersToTrack(track)
+	lp.subscribeOthersToTrack(vtrack)
 
 	m.broadcast(channel, "", signalEnvelope{
 		Type:    "presence",
@@ -227,6 +247,21 @@ func (lp *voiceLocalPeer) SendOpus(rtpPacket []byte) error {
 	lp.mu.Unlock()
 	if track == nil {
 		return errors.New("local peer has no audio track")
+	}
+	_, err := track.Write(rtpPacket)
+	return err
+}
+
+func (lp *voiceLocalPeer) SendVideoRTP(rtpPacket []byte) error {
+	lp.mu.Lock()
+	if lp.stopped {
+		lp.mu.Unlock()
+		return errors.New("local peer stopped")
+	}
+	track := lp.video
+	lp.mu.Unlock()
+	if track == nil {
+		return errors.New("local peer has no video track")
 	}
 	_, err := track.Write(rtpPacket)
 	return err

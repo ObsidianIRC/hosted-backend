@@ -194,6 +194,26 @@ func (o *Orca) registerDefaultTools() {
 		Parameters:  objectSchema().build(),
 		Handler:     toolSpamfilterList,
 	})
+
+	// --- Voice-channel media tools (operator-only, voice-only) ---------
+
+	o.registerTool(Tool{
+		Name:        "play_video",
+		Description: "Play a video by URL on Orca's video feed in a voice channel. Use the same voice channel the user is currently in. Audio + video are transcoded via ffmpeg and streamed to all participants. Preempts any previously playing video. Stops automatically after 10 minutes or when stop_video is called.",
+		Parameters: objectSchema(
+			prop("channel", "string", "Voice channel to play in (e.g. ^vc-opers). Use the channel the speaker is in."),
+			prop("url", "string", "HTTP(S) URL of the video to play."),
+		).required("channel", "url").build(),
+		Handler: toolPlayVideo,
+	})
+	o.registerTool(Tool{
+		Name:        "stop_video",
+		Description: "Stop any currently-playing video in a voice channel.",
+		Parameters: objectSchema(
+			prop("channel", "string", "Voice channel to stop playback in."),
+		).required("channel").build(),
+		Handler: toolStopVideo,
+	})
 }
 
 func toolUserGet(ctx context.Context, o *Orca, params map[string]any, w *bot.WorkflowEmitter) (string, error) {
@@ -486,6 +506,46 @@ func toolServerList(ctx context.Context, o *Orca, params map[string]any, w *bot.
 	b, _ := json.Marshal(servers)
 	_ = st.Result(fmt.Sprintf("%d servers", len(servers)))
 	return string(b), nil
+}
+
+func toolPlayVideo(ctx context.Context, o *Orca, params map[string]any, w *bot.WorkflowEmitter) (string, error) {
+	channel, _ := params["channel"].(string)
+	url, _ := params["url"].(string)
+	if channel == "" || url == "" {
+		return "", fmt.Errorf("channel and url required")
+	}
+	if o.voice == nil {
+		return "", fmt.Errorf("voice subsystem not running")
+	}
+	st := w.StartToolCall("play-video", "Play "+url+" in "+channel, params)
+	// Use a background context so the playback survives the
+	// invocation's own context cancelling when the LLM round-trip
+	// finishes -- the player has its own duration cap and explicit
+	// stop tool.
+	if err := o.voice.playVideo(context.Background(), channel, url); err != nil {
+		_ = st.Failed(err.Error())
+		return "", err
+	}
+	_ = st.Result("playing " + url)
+	return fmt.Sprintf(`{"ok":true,"channel":%q,"url":%q,"note":"playback started; auto-stops after 10 min or on stop_video"}`, channel, url), nil
+}
+
+func toolStopVideo(ctx context.Context, o *Orca, params map[string]any, w *bot.WorkflowEmitter) (string, error) {
+	channel, _ := params["channel"].(string)
+	if channel == "" {
+		return "", fmt.Errorf("channel required")
+	}
+	if o.voice == nil {
+		return "", fmt.Errorf("voice subsystem not running")
+	}
+	st := w.StartToolCall("stop-video", "Stop video in "+channel, params)
+	stopped := o.voice.stopVideo(channel)
+	if stopped {
+		_ = st.Result("stopped")
+		return fmt.Sprintf(`{"ok":true,"channel":%q,"stopped":true}`, channel), nil
+	}
+	_ = st.Result("nothing playing")
+	return fmt.Sprintf(`{"ok":true,"channel":%q,"stopped":false,"note":"no active playback"}`, channel), nil
 }
 
 func toolSpamfilterList(ctx context.Context, o *Orca, params map[string]any, w *bot.WorkflowEmitter) (string, error) {

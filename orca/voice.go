@@ -59,6 +59,11 @@ type voiceSubsystem struct {
 	// lazily on first wake-only utterance. No TTS round-trip.
 	ackOnce  sync.Once
 	ackAudio []byte
+
+	// activeVideo tracks one in-flight ffmpeg-driven video playback
+	// per channel. play_video preempts any prior; stop_video kills it.
+	videoMu     sync.Mutex
+	activeVideo map[string]*videoPlayer
 }
 
 // followupWindow is how long Orca waits for a query after a bare

@@ -38,10 +38,11 @@ func (a voiceAPIAdapter) RegisterLocal(nick, channel string, onRTP orca.LocalRTP
 
 type localPeerAdapter struct{ inner LocalPeer }
 
-func (a localPeerAdapter) SendOpus(pkt []byte) error { return a.inner.SendOpus(pkt) }
-func (a localPeerAdapter) Stop() error               { return a.inner.Stop() }
-func (a localPeerAdapter) BroadcastSpeaking()        { a.inner.BroadcastSpeaking() }
-func (a localPeerAdapter) BroadcastSilent()          { a.inner.BroadcastSilent() }
+func (a localPeerAdapter) SendOpus(pkt []byte) error     { return a.inner.SendOpus(pkt) }
+func (a localPeerAdapter) SendVideoRTP(pkt []byte) error { return a.inner.SendVideoRTP(pkt) }
+func (a localPeerAdapter) Stop() error                   { return a.inner.Stop() }
+func (a localPeerAdapter) BroadcastSpeaking()            { a.inner.BroadcastSpeaking() }
+func (a localPeerAdapter) BroadcastSilent()              { a.inner.BroadcastSilent() }
 
 var errVoiceMgrNil = errVoiceMgrNilError{}
 

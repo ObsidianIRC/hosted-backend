@@ -21,6 +21,10 @@ type LocalRTPCallback func(speaker, kind string, payload []byte)
 
 type LocalPeer interface {
 	SendOpus(rtpPacket []byte) error
+	// SendVideoRTP appends one VP8 RTP packet to the local peer's
+	// outbound video track. Used by the video playback tool to fan
+	// out a transcoded video stream to remote peers.
+	SendVideoRTP(rtpPacket []byte) error
 	Stop() error
 	// BroadcastSpeaking / BroadcastSilent emit presence updates so
 	// remote clients' speaker activity indicators pulse while the

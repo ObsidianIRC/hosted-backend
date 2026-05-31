@@ -553,23 +553,26 @@ func (m *voiceManager) handleJoin(nick, channel, account string) {
 	room.mu.RUnlock()
 	for _, lp := range localPeers {
 		lp.mu.Lock()
-		track := lp.audio
+		audioTrack := lp.audio
+		videoTrack := lp.video
 		lp.mu.Unlock()
-		if track == nil {
-			continue
+		for _, track := range []*webrtc.TrackLocalStaticRTP{audioTrack, videoTrack} {
+			if track == nil {
+				continue
+			}
+			s, err := pc.AddTrack(track)
+			if err != nil {
+				log.Printf("voice: subscribe %s -> local %s: %v",
+					nick, lp.nick, err)
+				continue
+			}
+			peer.mu.Lock()
+			if peer.subSenders == nil {
+				peer.subSenders = map[string]*webrtc.RTPSender{}
+			}
+			peer.subSenders[track.ID()] = s
+			peer.mu.Unlock()
 		}
-		s, err := pc.AddTrack(track)
-		if err != nil {
-			log.Printf("voice: subscribe %s -> local %s: %v",
-				nick, lp.nick, err)
-			continue
-		}
-		peer.mu.Lock()
-		if peer.subSenders == nil {
-			peer.subSenders = map[string]*webrtc.RTPSender{}
-		}
-		peer.subSenders[track.ID()] = s
-		peer.mu.Unlock()
 	}
 	// Local peers broadcast mic-on at registration time, which is
 	// BEFORE any client is in the room. New joiners would therefore
