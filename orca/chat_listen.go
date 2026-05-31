@@ -261,6 +261,10 @@ func (o *Orca) runChatReply(ctx context.Context, channel, speaker, query string)
 		})
 		if err != nil {
 			log.Printf("[orca/chat] %s/%s: ask: %v", channel, speaker, err)
+			// Surface to the channel so the user knows we tried.
+			gw.SendMessage(channel,
+				fmt.Sprintf("%s: I can't reply right now (%s).", speaker, summarizeChatError(err)),
+				false)
 			return
 		}
 		asstTurn := ConvTurn{

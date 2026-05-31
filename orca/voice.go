@@ -105,6 +105,28 @@ func (vs *voiceSubsystem) disarmTTS(channel string, ctx context.Context) {
 	vs.ttsMu.Unlock()
 }
 
+// summarizeChatError extracts a short human-readable phrase from a
+// chat-provider error. The full err is usually a giant JSON blob from
+// Pollinations/Azure; we just want one line for the channel.
+func summarizeChatError(err error) string {
+	if err == nil {
+		return "unknown error"
+	}
+	s := err.Error()
+	low := strings.ToLower(s)
+	switch {
+	case strings.Contains(low, "402") || strings.Contains(low, "payment required") || strings.Contains(low, "insufficient balance"):
+		return "out of pollen, top up Pollinations to continue"
+	case strings.Contains(low, "429") || strings.Contains(low, "rate"):
+		return "rate-limited, try again in a moment"
+	case strings.Contains(low, "timeout") || strings.Contains(low, "deadline"):
+		return "model timed out"
+	case strings.Contains(low, "5") && strings.Contains(low, "00 "):
+		return "upstream model error"
+	}
+	return truncate(s, 120)
+}
+
 // cancelTTS preempts any active TTS in the channel without arming a
 // new one. Used by wake-only pings: we want to silence Orca mid-reply
 // so the speaker has room for their follow-up.
@@ -304,6 +326,14 @@ func (vs *voiceSubsystem) handleUtterance(ctx context.Context, channel, speaker 
 	answer, err := vs.askPlain(ctx, channel, speaker, query)
 	if err != nil {
 		log.Printf("[orca/voice] %s/%s: ask: %v", channel, speaker, err)
+		// Surface chat failures into the channel so the user knows
+		// Orca isn't dead -- pollen exhausted, model 5xx, etc. The
+		// summary trims giant JSON error bodies down to one line.
+		if gw := vs.o.Gateway(); gw != nil {
+			gw.SendMessage(channel,
+				fmt.Sprintf("%s: I can't reply right now (%s).", speaker, summarizeChatError(err)),
+				false)
+		}
 		return
 	}
 
