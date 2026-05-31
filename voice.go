@@ -571,6 +571,14 @@ func (m *voiceManager) handleJoin(nick, channel, account string) {
 		peer.subSenders[track.ID()] = s
 		peer.mu.Unlock()
 	}
+	// Local peers broadcast their mic-on state at registration time,
+	// which is BEFORE any client is in the room, so new joiners
+	// default to "muted" in the UI. Re-broadcast each local peer's
+	// presence{mic:on} now that this new peer is a channel member
+	// and can actually receive it.
+	for _, lp := range localPeers {
+		lp.BroadcastMicOn()
+	}
 
 	// Hook ICE candidate emission so we relay them back to the client.
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {

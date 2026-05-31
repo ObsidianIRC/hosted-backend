@@ -138,6 +138,23 @@ func (m *voiceManager) RegisterLocal(nick, channel string, onRTP RTPCallback) (L
 	return lp, nil
 }
 
+// BroadcastMicOn emits a presence{Kind:"mic", State:"on"} for this
+// local peer. Called both at registration and any time a new peer
+// joins (since the initial broadcast at registration has no audience
+// when the bot starts up before any humans).
+func (lp *voiceLocalPeer) BroadcastMicOn() {
+	if lp == nil || lp.mgr == nil || lp.room == nil {
+		return
+	}
+	lp.mgr.broadcast(lp.room.name, "", signalEnvelope{
+		Type:    "presence",
+		Member:  lp.nick,
+		State:   "on",
+		Kind:    "mic",
+		Channel: lp.room.name,
+	})
+}
+
 // BroadcastSpeaking emits a presence{Kind:"speaking"} for this local
 // peer; call when an outbound TTS reply starts streaming so remote
 // clients' activity indicators light up. Pair with BroadcastSilent

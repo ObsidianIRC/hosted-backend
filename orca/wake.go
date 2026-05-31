@@ -18,7 +18,15 @@ type wakeMatcher struct {
 func newWakeMatcher() *wakeMatcher {
 	src := os.Getenv("ORCA_WAKE_WORDS")
 	if src == "" {
-		src = "hey orca,hi orca,orca,okay orca,ok orca"
+		// Defaults include common Whisper mis-hearings of "Orca" so
+		// the bot still responds when STT fumbles the proper noun.
+		// Whisper-tiny especially mangles it: "oka", "orga", "okra",
+		// "awker", "heioka" all show up in real transcripts.
+		src = strings.Join([]string{
+			"hey orca", "hi orca", "orca", "okay orca", "ok orca",
+			"hey oka", "hey okra", "hey orga", "hey awker", "hey arca",
+			"heioka", "hayoka", "oka", "orga", "okra", "awker", "arca",
+		}, ",")
 	}
 	var phrases []string
 	for _, p := range strings.Split(src, ",") {
