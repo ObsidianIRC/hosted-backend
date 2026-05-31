@@ -22,6 +22,11 @@ type LocalRTPCallback func(speaker, kind string, payload []byte)
 type LocalPeer interface {
 	SendOpus(rtpPacket []byte) error
 	Stop() error
+	// BroadcastSpeaking / BroadcastSilent emit presence updates so
+	// remote clients' speaker activity indicators pulse while the
+	// local peer is producing audio. Optional; safe to be no-ops.
+	BroadcastSpeaking()
+	BroadcastSilent()
 }
 
 // localTap is a VoiceTap backed by the in-process SFU LocalParticipant.
@@ -139,6 +144,8 @@ func (t *localTap) Speak(ctx context.Context, channel string, audio []byte, mime
 		t.encs[channel] = enc
 	}
 	t.mu.Unlock()
+	peer.BroadcastSpeaking()
+	defer peer.BroadcastSilent()
 	return speakOpus(peer, audio, mime, enc, pktr)
 }
 

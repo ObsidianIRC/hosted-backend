@@ -36,6 +36,12 @@ type LocalPeer interface {
 	// just write to it.
 	SendOpus(rtpPacket []byte) error
 	Stop() error
+	// BroadcastSpeaking / BroadcastSilent emit presence updates so
+	// remote clients' speaker activity indicators light up while
+	// this local peer is producing audio. The methods are nil-safe;
+	// callers can wrap with `defer peer.BroadcastSilent()` etc.
+	BroadcastSpeaking()
+	BroadcastSilent()
 }
 
 type voiceLocalPeer struct {
@@ -117,9 +123,47 @@ func (m *voiceManager) RegisterLocal(nick, channel string, onRTP RTPCallback) (L
 		Channel: channel,
 		Role:    "streamer",
 	})
+	// Local peers always have an open mic (they don't toggle mute);
+	// without an explicit "mic on" presence the client UI shows
+	// them as muted forever.
+	m.broadcast(channel, "", signalEnvelope{
+		Type:    "presence",
+		Member:  nick,
+		State:   "on",
+		Kind:    "mic",
+		Channel: channel,
+	})
 
 	log.Printf("voice/local: registered %s in %s", nick, channel)
 	return lp, nil
+}
+
+// BroadcastSpeaking emits a presence{Kind:"speaking"} for this local
+// peer; call when an outbound TTS reply starts streaming so remote
+// clients' activity indicators light up. Pair with BroadcastSilent
+// when the reply finishes.
+func (lp *voiceLocalPeer) BroadcastSpeaking() {
+	if lp == nil || lp.mgr == nil || lp.room == nil {
+		return
+	}
+	lp.mgr.broadcast(lp.room.name, "", signalEnvelope{
+		Type:    "presence",
+		Member:  lp.nick,
+		Kind:    "speaking",
+		Channel: lp.room.name,
+	})
+}
+
+func (lp *voiceLocalPeer) BroadcastSilent() {
+	if lp == nil || lp.mgr == nil || lp.room == nil {
+		return
+	}
+	lp.mgr.broadcast(lp.room.name, "", signalEnvelope{
+		Type:    "presence",
+		Member:  lp.nick,
+		Kind:    "silent",
+		Channel: lp.room.name,
+	})
 }
 
 func (m *voiceManager) markLocalExpected(channel, nick string) {

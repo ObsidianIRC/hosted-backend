@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"strings"
 	"sync"
@@ -45,7 +46,24 @@ type voiceSubsystem struct {
 
 	mu      sync.Mutex
 	running map[string]context.CancelFunc
+
+	// followups tracks the open "wake-only listen window" per
+	// channel|speaker. After a user says just "Hey Orca", they have
+	// followupWindow seconds to speak again with the actual query
+	// (no wake word required on the second utterance). Empty when
+	// no window is open for a given speaker.
+	followMu  sync.Mutex
+	followups map[string]time.Time
+
+	// ackAudio is a cached WAV of a short acknowledgement tone, built
+	// lazily on first wake-only utterance. No TTS round-trip.
+	ackOnce  sync.Once
+	ackAudio []byte
 }
+
+// followupWindow is how long Orca waits for a query after a bare
+// "Hey Orca" before going silent again.
+const followupWindow = 10 * time.Second
 
 // WithVoiceTap replaces Orca's voice audio backend. Call before Start.
 // Without a real tap, the audio path is a no-op (logs only).
@@ -193,15 +211,31 @@ func (vs *voiceSubsystem) handleUtterance(ctx context.Context, channel, speaker 
 	log.Printf("[orca/voice] %s/%s: %q", channel, speaker, transcript)
 
 	matched, query := vs.wake.match(transcript)
-	if vs.cfg.WakeOnly && !matched {
+
+	// Wake-only utterance ("Hey Orca" with nothing else): play an
+	// acknowledgement tone and arm a 10 s follow-up window so the
+	// speaker can talk again WITHOUT having to say "Hey Orca" first.
+	if matched && (query == "" || query == "(Acknowledge briefly that you're here.)") {
+		log.Printf("[orca/voice] %s/%s: wake-only -> ack + listen window", channel, speaker)
+		vs.armFollowup(channel, speaker)
+		vs.playAck(ctx, channel)
 		return
 	}
+
 	if !matched {
+		// Not wake-addressed. Check if this speaker is inside an open
+		// follow-up window from a recent wake-only ping.
+		if vs.cfg.WakeOnly && !vs.consumeFollowup(channel, speaker) {
+			return
+		}
 		query = transcript
 	}
 	if query == "" {
 		return
 	}
+	// Any real query consumes any pending follow-up window for this
+	// speaker, so a subsequent unrelated utterance doesn't get caught.
+	vs.consumeFollowup(channel, speaker)
 
 	answer, err := vs.askPlain(ctx, channel, speaker, query)
 	if err != nil {
@@ -387,4 +421,93 @@ func wavWrap(pcm []byte, sampleRate, channels int) []byte {
 	_ = binary.Write(buf, binary.LittleEndian, uint32(len(pcm)))
 	buf.Write(pcm)
 	return buf.Bytes()
+}
+
+// armFollowup opens a follow-up window for (channel, speaker). The
+// next utterance from that speaker within followupWindow is treated
+// as a real query even if it doesn't start with a wake word.
+func (vs *voiceSubsystem) armFollowup(channel, speaker string) {
+	key := channel + "|" + strings.ToLower(speaker)
+	vs.followMu.Lock()
+	if vs.followups == nil {
+		vs.followups = map[string]time.Time{}
+	}
+	vs.followups[key] = time.Now().Add(followupWindow)
+	vs.followMu.Unlock()
+}
+
+// consumeFollowup reports whether (channel, speaker) is currently
+// inside a live follow-up window, and clears it either way (one
+// follow-up per ping). Expired entries are cleared opportunistically.
+func (vs *voiceSubsystem) consumeFollowup(channel, speaker string) bool {
+	key := channel + "|" + strings.ToLower(speaker)
+	now := time.Now()
+	vs.followMu.Lock()
+	defer vs.followMu.Unlock()
+	if vs.followups == nil {
+		return false
+	}
+	deadline, ok := vs.followups[key]
+	if !ok {
+		return false
+	}
+	delete(vs.followups, key)
+	return now.Before(deadline)
+}
+
+// playAck plays the cached acknowledgement tone into the channel.
+// Cheap because the WAV is built once and replayed; no TTS round-trip.
+func (vs *voiceSubsystem) playAck(ctx context.Context, channel string) {
+	vs.ackOnce.Do(func() {
+		vs.ackAudio = buildAckTone()
+	})
+	if vs.ackAudio == nil || vs.tap == nil {
+		return
+	}
+	if err := vs.tap.Speak(ctx, channel, vs.ackAudio, "audio/wav"); err != nil {
+		log.Printf("[orca/voice] %s: ack speak: %v", channel, err)
+	}
+}
+
+// buildAckTone synthesizes a short 2-note chirp -- a quiet sine
+// "bip-boop" at ~880 Hz then ~660 Hz, total ~200 ms. Universally
+// reads as "I'm listening" without needing TTS.
+func buildAckTone() []byte {
+	const (
+		rate     = 24000
+		noteMs   = 90
+		gapMs    = 10
+		amp      = 0.18 // 0..1; keep quiet so it doesn't startle
+	)
+	samplesPerNote := rate * noteMs / 1000
+	samplesGap := rate * gapMs / 1000
+	notes := []float64{880, 660}
+
+	pcm := make([]int16, 0, (samplesPerNote+samplesGap)*len(notes))
+	for _, f := range notes {
+		for i := 0; i < samplesPerNote; i++ {
+			t := float64(i) / float64(rate)
+			// Gentle attack/release envelope so it sounds like a bell,
+			// not a click.
+			env := 1.0
+			fadeSamples := samplesPerNote / 6
+			if i < fadeSamples {
+				env = float64(i) / float64(fadeSamples)
+			} else if i > samplesPerNote-fadeSamples {
+				env = float64(samplesPerNote-i) / float64(fadeSamples)
+			}
+			s := amp * env * math.Sin(2*math.Pi*f*t)
+			pcm = append(pcm, int16(s*32767))
+		}
+		for i := 0; i < samplesGap; i++ {
+			pcm = append(pcm, 0)
+		}
+	}
+	// 16-bit mono → wavWrap-friendly bytes.
+	raw := make([]byte, len(pcm)*2)
+	for i, v := range pcm {
+		raw[2*i] = byte(v)
+		raw[2*i+1] = byte(v >> 8)
+	}
+	return wavWrap(raw, rate, 1)
 }
