@@ -162,6 +162,68 @@ func (m *Memory) BuildMessages(conv *Conversation, sysPrompt, speakerNote, userQ
 	if userQuery != "" {
 		out = append(out, ai.Message{Role: ai.RoleUser, Content: userQuery})
 	}
+	// Final pass: prune incomplete tool-call sequences. An
+	// assistant{tool_calls:[A,B]} must be followed by tool messages
+	// for both A and B; if any are missing (because of past
+	// interrupted iterations, compaction edge cases, etc.) Azure
+	// 400s the whole request. Convert any incomplete assistant into
+	// a plain assistant message and drop its dangling tool responses.
+	return repairToolCallSequences(out)
+}
+
+// repairToolCallSequences walks the messages and ensures every
+// assistant{tool_calls} has matching tool responses for every call
+// ID immediately after. Incomplete sequences are sanitized:
+//   - The assistant message's ToolCalls field is cleared (it becomes
+//     a plain assistant content message).
+//   - Any tool responses that referenced the dropped call IDs are
+//     discarded (they'd be orphaned otherwise).
+//
+// This is defensive cleanup, not a behavior change -- a well-formed
+// conv produces identical output.
+func repairToolCallSequences(in []ai.Message) []ai.Message {
+	out := make([]ai.Message, 0, len(in))
+	i := 0
+	for i < len(in) {
+		m := in[i]
+		if m.Role != ai.RoleAssistant || len(m.ToolCalls) == 0 {
+			out = append(out, m)
+			i++
+			continue
+		}
+		// Collect the contiguous run of tool responses immediately
+		// after the assistant message.
+		want := map[string]bool{}
+		for _, tc := range m.ToolCalls {
+			want[tc.ID] = true
+		}
+		seen := map[string]bool{}
+		j := i + 1
+		for j < len(in) && in[j].Role == ai.RoleTool {
+			if want[in[j].ToolCallID] {
+				seen[in[j].ToolCallID] = true
+			}
+			j++
+		}
+		if len(seen) == len(want) {
+			// Complete sequence: pass through verbatim.
+			out = append(out, in[i:j]...)
+			i = j
+			continue
+		}
+		// Incomplete: drop the ToolCalls so the assistant is a plain
+		// content message, and drop EVERY tool response in the run
+		// (they're all orphans once the calls disappear). Azure
+		// rejects empty assistant content too, so substitute a
+		// placeholder when needed.
+		san := m
+		san.ToolCalls = nil
+		if san.Content == "" {
+			san.Content = "(tool call attempted; result unavailable)"
+		}
+		out = append(out, san)
+		i = j
+	}
 	return out
 }
 
