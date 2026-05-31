@@ -25,8 +25,11 @@ type LocalPeer interface {
 }
 
 // localTap is a VoiceTap backed by the in-process SFU LocalParticipant.
-// Audio I/O is wired but the data is raw RTP packets — Opus codec
-// encode/decode lives outside this layer and is the next milestone.
+// Per-channel state (encoder + packetizer) persists across speakOpus
+// calls so the client sees ONE coherent RTP stream with a stable SSRC
+// and monotonic sequence/timestamps -- not a fresh stream per TTS
+// reply. Without persistence the client's jitter buffer re-locks on
+// every reply and drops the first ~200 ms of audio.
 type localTap struct {
 	api  LocalParticipantAPI
 	nick string
@@ -34,6 +37,8 @@ type localTap struct {
 	mu     sync.Mutex
 	peers  map[string]LocalPeer        // channel -> registered local peer
 	frames map[string]chan AudioFrame  // channel -> outbound to Orca's loop
+	pktrs  map[string]*RTPPacketizer   // channel -> persistent RTP packetizer
+	encs   map[string]*OpusEncoder     // channel -> persistent Opus encoder
 }
 
 func NewLocalTap(api LocalParticipantAPI, nick string) VoiceTap {
@@ -42,6 +47,8 @@ func NewLocalTap(api LocalParticipantAPI, nick string) VoiceTap {
 		nick:   nick,
 		peers:  map[string]LocalPeer{},
 		frames: map[string]chan AudioFrame{},
+		pktrs:  map[string]*RTPPacketizer{},
+		encs:   map[string]*OpusEncoder{},
 	}
 }
 
@@ -87,6 +94,8 @@ func (t *localTap) Leave(ctx context.Context, channel string) error {
 		close(ch)
 		delete(t.frames, channel)
 	}
+	delete(t.pktrs, channel)
+	delete(t.encs, channel)
 	t.mu.Unlock()
 	if peer != nil {
 		return peer.Stop()
@@ -107,11 +116,30 @@ func (t *localTap) Frames(ctx context.Context, channel string) (<-chan AudioFram
 func (t *localTap) Speak(ctx context.Context, channel string, audio []byte, mime string) error {
 	t.mu.Lock()
 	peer := t.peers[channel]
-	t.mu.Unlock()
 	if peer == nil {
+		t.mu.Unlock()
 		return fmt.Errorf("not joined to %s", channel)
 	}
-	return speakOpus(peer, audio, mime)
+	// Lazily build the per-channel persistent encoder + packetizer.
+	// One SSRC per local-peer-per-channel -> client jitter buffer
+	// stays locked across all TTS replies.
+	pktr := t.pktrs[channel]
+	if pktr == nil {
+		pktr = NewRTPPacketizer(NextSSRC())
+		t.pktrs[channel] = pktr
+	}
+	enc := t.encs[channel]
+	if enc == nil {
+		e, err := NewOpusEncoder()
+		if err != nil {
+			t.mu.Unlock()
+			return fmt.Errorf("opus encoder: %w", err)
+		}
+		enc = e
+		t.encs[channel] = enc
+	}
+	t.mu.Unlock()
+	return speakOpus(peer, audio, mime, enc, pktr)
 }
 
 // silenceRMS is the squared-amplitude threshold that marks a frame as
@@ -270,8 +298,16 @@ func int16ToBytes(samples []int16) []byte {
 // speakOpus is the outbound path: MP3/WAV bytes from the TTS provider
 // get decoded to PCM, resampled to 48 kHz stereo, encoded to Opus in
 // 20 ms frames, RTP-wrapped, and written to the LocalPeer's outbound
-// track at real-time pacing.
-func speakOpus(peer LocalPeer, audio []byte, mime string) error {
+// track at real-time pacing. enc + pktr are persistent across replies
+// (per local peer) so the client sees one continuous SSRC; see
+// localTap.Speak for the lifecycle.
+//
+// A short silence preamble (preambleSilenceFrames * 20 ms) is sent
+// before the real audio to prime any client-side jitter buffer that's
+// been idle since the previous reply. Standard WebRTC TTS hygiene.
+const preambleSilenceFrames = 10
+
+func speakOpus(peer LocalPeer, audio []byte, mime string, enc *OpusEncoder, pktr *RTPPacketizer) error {
 	var pcm []int16
 	var srcRate, srcChannels int
 	mime = strings.ToLower(mime)
@@ -298,11 +334,11 @@ func speakOpus(peer LocalPeer, audio []byte, mime string) error {
 		pcm = Resample(pcm, srcRate, opusSampleRate, srcChannels)
 	}
 
-	enc, err := NewOpusEncoder()
-	if err != nil {
-		return fmt.Errorf("opus encoder: %w", err)
-	}
-	pktr := NewRTPPacketizer(NextSSRC())
+	// Prepend silence so the first words of the actual reply don't
+	// get clipped by jitter-buffer warmup on the receiver.
+	silence := make([]int16,
+		preambleSilenceFrames*opusSamplesFrame*opusChannels)
+	pcm = append(silence, pcm...)
 
 	frameSize := opusSamplesFrame * opusChannels // 1920 samples per 20 ms
 	frameInterval := time.Duration(opusFrameMs) * time.Millisecond

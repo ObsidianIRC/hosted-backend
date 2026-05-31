@@ -336,19 +336,14 @@ func (vs *voiceSubsystem) askPlain(ctx context.Context, channel, speaker, query 
 		}
 	}
 
+	// NB: do NOT append the final assistant turn here -- the loop
+	// already appended it (asstTurn) on the no-tool-calls iteration
+	// that breaks out. A second append would corrupt the conversation
+	// history with a duplicate assistant turn, which downstream
+	// BuildMessages can slice through and produce orphan tool turns.
 	if answer == "" {
 		answer = "(no answer)"
 	}
-	conv.append(ConvTurn{
-		Role:    ai.RoleAssistant,
-		Time:    time.Now().UTC(),
-		Content: answer,
-	})
-	vs.o.logger.AppendTurn(key, ConvTurn{
-		Role:    ai.RoleAssistant,
-		Time:    time.Now().UTC(),
-		Content: answer,
-	})
 	go vs.o.memory.MaybeCompact(context.Background(), conv)
 	return answer, nil
 }

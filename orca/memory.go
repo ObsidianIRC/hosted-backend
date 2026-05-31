@@ -116,6 +116,19 @@ func (m *Memory) BuildMessages(conv *Conversation, sysPrompt, speakerNote, userQ
 	if len(turns) > m.maxTurns {
 		start = len(turns) - m.maxTurns
 	}
+	// Walk forward to a safe boundary: never start the window on a
+	// `tool` turn (orphaned -- LLM rejects "tool" with no preceding
+	// "assistant with tool_calls") and never start on an
+	// `assistant{tool_calls}` whose tool responses we'd have to also
+	// include. Easiest correct rule: advance to the next `user` turn,
+	// which is always a valid boundary in our schema.
+	for start < len(turns) {
+		t := turns[start]
+		if t.Role == ai.RoleUser {
+			break
+		}
+		start++
+	}
 	for _, t := range turns[start:] {
 		switch t.Role {
 		case ai.RoleUser:
