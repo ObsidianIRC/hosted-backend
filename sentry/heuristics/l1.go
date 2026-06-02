@@ -53,6 +53,23 @@ type UserSnapshot struct {
 	DupHashCount   int     // count of duplicate hashes in recent window
 	URLCount       int     // URLs in recent window
 	UpperRatioMean float64 // avg uppercase ratio in recent window
+
+	// BurstStartIdleGap is the idle duration that preceded the start
+	// of the user's current burst. Zero outside an active burst.
+	// Sticky as the burst continues -- the rule layer can rely on it
+	// after several burst messages without losing the "they were
+	// silent before this" signal.
+	BurstStartIdleGap time.Duration
+
+	// Behavioural counts over the recent 60s window.
+	NickFlipRate float64 // nick changes / min
+	HopRate      float64 // join+part actions / min
+
+	// PM telemetry over the recent 60s window.
+	PMRate         float64 // outbound user-PMs / min
+	PMTargetCount  int     // distinct recipients in the window
+	MentionRate    float64 // chan msgs that mention >=3 nicks / min
+	NickServSpoofs int     // PMs whose body matches a NickServ phishing pattern
 }
 
 // Registry holds all installed rules.
@@ -244,9 +261,13 @@ func (i idleBurstRule) Observe(u UserSnapshot, ev *events.Event) []Alert {
 	if u.RecentMsgRate < i.burstPerMin {
 		return nil
 	}
-	idle := ev.At().Sub(u.LastMsgAt)
-	// Idle time only meaningful if there WAS a previous message.
-	if !u.LastMsgAt.IsZero() && idle < i.idleBefore {
+	// The user must be in a burst that started AFTER a long silence.
+	// BurstStartIdleGap is set by the state layer when a message
+	// arrives following >= burstResumeThreshold of inactivity, and
+	// stays set until the burst itself ends -- so the rule sees a
+	// stable "you came back from idle and are still going" signal
+	// even on the 12th burst message.
+	if u.BurstStartIdleGap < i.idleBefore {
 		return nil
 	}
 	conf := u.RecentMsgRate / (u.RecentMsgRate + i.burstPerMin)
@@ -335,7 +356,165 @@ func DefaultRegistry() *Registry {
 	})
 	r.Register(ctcpStormRule{threshold: 6})
 	r.Register(shoutingRule{minMessages: 4, upperThreshold: 0.85})
+	r.Register(nickFlipRule{threshold: 5})  // >5 nick changes/min
+	r.Register(hopFloodRule{threshold: 8})  // >8 join+part/min
+	r.Register(pmFloodRule{threshold: 12})  // >12 PMs/min outbound
+	r.Register(pmShotgunRule{threshold: 5}) // >=5 distinct PM targets in window
+	r.Register(mentionStormRule{threshold: 3}) // >=3 mention-bomb msgs/min
+	r.Register(nickServSpoofRule{})
 	return r
+}
+
+// pmFloodRule: outbound PM rate above threshold.
+type pmFloodRule struct{ threshold float64 }
+
+func (p pmFloodRule) Name() string { return "pm_flood" }
+func (p pmFloodRule) Observe(u UserSnapshot, ev *events.Event) []Alert {
+	if ev.Kind != events.EventUserMsg {
+		return nil
+	}
+	if u.PMRate < p.threshold {
+		return nil
+	}
+	conf := 1.0 - (p.threshold / (u.PMRate + 1e-6))
+	if conf < 0 {
+		conf = 0
+	}
+	if conf > 1 {
+		conf = 1
+	}
+	return []Alert{{
+		Kind: "pm_flood", UID: u.UID, Nick: u.Nick,
+		Confidence: conf,
+		Evidence:   formatRate(u.PMRate, "PMs/min outbound"),
+		At:         ev.At(), TriggeredBy: ev,
+	}}
+}
+
+// pmShotgunRule: one sender PMing many distinct targets in a window.
+// Spambot / harassment pattern.
+type pmShotgunRule struct{ threshold int }
+
+func (p pmShotgunRule) Name() string { return "pm_shotgun" }
+func (p pmShotgunRule) Observe(u UserSnapshot, ev *events.Event) []Alert {
+	if ev.Kind != events.EventUserMsg {
+		return nil
+	}
+	if u.PMTargetCount < p.threshold {
+		return nil
+	}
+	conf := float64(u.PMTargetCount-p.threshold) / float64(u.PMTargetCount+1)
+	if conf < 0.3 {
+		conf = 0.3
+	}
+	return []Alert{{
+		Kind: "pm_shotgun", UID: u.UID, Nick: u.Nick,
+		Confidence: conf,
+		Evidence:   formatInt(u.PMTargetCount, "distinct PM targets in 60s"),
+		At:         ev.At(), TriggeredBy: ev,
+	}}
+}
+
+// mentionStormRule: chan msgs that tag many users at once -- common
+// harassment / pile-on pattern.
+type mentionStormRule struct{ threshold float64 }
+
+func (m mentionStormRule) Name() string { return "mention_storm" }
+func (m mentionStormRule) Observe(u UserSnapshot, ev *events.Event) []Alert {
+	if ev.Kind != events.EventChanMsg {
+		return nil
+	}
+	if u.MentionRate < m.threshold {
+		return nil
+	}
+	conf := 1.0 - (m.threshold / (u.MentionRate + 1e-6))
+	if conf < 0 {
+		conf = 0
+	}
+	if conf > 1 {
+		conf = 1
+	}
+	return []Alert{{
+		Kind: "mention_storm", UID: u.UID, Nick: u.Nick, Channel: ev.Channel,
+		Confidence: conf,
+		Evidence:   formatRate(u.MentionRate, "mention-bomb msgs/min"),
+		At:         ev.At(), TriggeredBy: ev,
+	}}
+}
+
+// nickServSpoofRule: detected NickServ phishing language in a PM.
+type nickServSpoofRule struct{}
+
+func (n nickServSpoofRule) Name() string { return "nickserv_spoof" }
+func (n nickServSpoofRule) Observe(u UserSnapshot, ev *events.Event) []Alert {
+	if ev.Kind != events.EventUserMsg {
+		return nil
+	}
+	if u.NickServSpoofs < 1 {
+		return nil
+	}
+	conf := 0.7 + 0.05*float64(u.NickServSpoofs)
+	if conf > 1 {
+		conf = 1
+	}
+	return []Alert{{
+		Kind: "nickserv_spoof", UID: u.UID, Nick: u.Nick,
+		Confidence: conf,
+		Evidence:   formatInt(u.NickServSpoofs, "NickServ-phishing PM(s)"),
+		At:         ev.At(), TriggeredBy: ev,
+	}}
+}
+
+// nickFlipRule: rapid nick changes -- common evasion / impersonation.
+type nickFlipRule struct{ threshold float64 }
+
+func (n nickFlipRule) Name() string { return "nick_flip" }
+func (n nickFlipRule) Observe(u UserSnapshot, ev *events.Event) []Alert {
+	if ev.Kind != events.EventNick {
+		return nil
+	}
+	if u.NickFlipRate < n.threshold {
+		return nil
+	}
+	conf := 1.0 - (n.threshold / (u.NickFlipRate + 1e-6))
+	if conf < 0 {
+		conf = 0
+	}
+	if conf > 1 {
+		conf = 1
+	}
+	return []Alert{{
+		Kind: "nick_flip", UID: u.UID, Nick: u.Nick,
+		Confidence: conf,
+		Evidence:   formatRate(u.NickFlipRate, "nick changes/min"),
+		At:         ev.At(), TriggeredBy: ev,
+	}}
+}
+
+// hopFloodRule: rapid join+part cycling. Botnets often hop channels.
+type hopFloodRule struct{ threshold float64 }
+
+func (h hopFloodRule) Name() string { return "hop_flood" }
+func (h hopFloodRule) Observe(u UserSnapshot, ev *events.Event) []Alert {
+	if ev.Kind != events.EventJoin && ev.Kind != events.EventPart {
+		return nil
+	}
+	if u.HopRate < h.threshold {
+		return nil
+	}
+	conf := 1.0 - (h.threshold / (u.HopRate + 1e-6))
+	if conf < 0 {
+		conf = 0
+	}
+	if conf > 1 {
+		conf = 1
+	}
+	return []Alert{{
+		Kind: "hop_flood", UID: u.UID, Nick: u.Nick, Channel: ev.Channel,
+		Confidence: conf,
+		Evidence:   formatRate(u.HopRate, "joins+parts/min"),
+		At:         ev.At(), TriggeredBy: ev,
+	}}
 }
 
 // --- formatting helpers (avoid pulling fmt into the hot path twice) -

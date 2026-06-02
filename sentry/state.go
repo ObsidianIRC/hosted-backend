@@ -41,11 +41,29 @@ type userState struct {
 	LastMsg      time.Time
 	LastJoin     time.Time
 	LastActivity time.Time
+	// FirstL1At is the timestamp of the first L1 alert ever raised
+	// against this user. Used by the L3 trainer as a gate: malicious
+	// labels are only fed to SGD AFTER L1 has flagged the user, so
+	// pre-burst events whose features look benign don't poison the
+	// classifier. Zero value means L1 has never flagged this user.
+	FirstL1At time.Time
+
+	// burstStartIdleGap is the idle duration that preceded the start
+	// of the user's CURRENT burst (if any). Sticky: stays set while
+	// messages keep flowing within burstHoldWindow; cleared when a
+	// gap larger than that is observed (the burst is "over"). Lets
+	// the idle_burst rule see that the recent chatter follows a long
+	// silence even after several burst messages have updated LastMsg.
+	burstStartIdleGap time.Duration
 
 	// Sliding windows for the heuristic layer.
-	recentMsgs   []messageRecord
-	recentJoins  []joinRecord
-	recentEvents []time.Time
+	recentMsgs    []messageRecord
+	recentJoins   []joinRecord
+	recentEvents  []time.Time
+	recentNicks   []time.Time // timestamps of nick changes
+	recentHops    []time.Time // joins+parts on any channel (hop = either)
+	recentUserMsg []userMsgRecord // outbound PRIVMSG to other users
+	recentMentions []time.Time   // chan msgs that mentioned multiple nicks
 
 	// Per-channel message counts (cleared on flushes).
 	perChannelMsgs map[string]int
@@ -69,6 +87,12 @@ type joinRecord struct {
 	Channel string
 }
 
+type userMsgRecord struct {
+	At     time.Time
+	Target string
+	Text   string
+}
+
 // FeatureVector is the numeric extraction handed to L2/L3. Always
 // derived from a userState snapshot. New features should be appended
 // (don't reorder existing slots so persisted L3 weights stay valid).
@@ -86,6 +110,8 @@ type FeatureVector struct {
 	URLCount        float64 // count of URLs in recent window
 	CTCPCount       float64 // CTCPs sent in recent window
 	IdleBurstScore  float64 // see computeFeatures -- catches "lurk then spam"
+	NickFlipRate    float64 // nick changes / min over recent window
+	HopRate         float64 // join+part / min over recent window
 }
 
 // hashText returns a 64-bit FNV hash of the lowercased, whitespace-
@@ -115,6 +141,23 @@ func (u *userState) onMessage(ev *events.Event) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	at := ev.At()
+
+	// burstStartIdleGap bookkeeping: must run BEFORE LastMsg is
+	// overwritten so we can measure the gap that preceded THIS msg.
+	const (
+		burstResumeThreshold = 5 * time.Minute  // gap that counts as "back from idle"
+		burstHoldWindow      = 60 * time.Second // after which we consider the burst over
+	)
+	if !u.LastMsg.IsZero() {
+		gap := at.Sub(u.LastMsg)
+		switch {
+		case gap >= burstResumeThreshold:
+			u.burstStartIdleGap = gap
+		case u.burstStartIdleGap > 0 && gap > burstHoldWindow:
+			u.burstStartIdleGap = 0
+		}
+	}
+
 	u.touch(at)
 	u.MsgCount++
 	u.LastMsg = at
@@ -130,6 +173,25 @@ func (u *userState) onMessage(ev *events.Event) {
 	}
 	if ev.Channel != "" {
 		u.perChannelMsgs[ev.Channel]++
+	}
+
+	// Track outbound PMs separately so pm_flood / pm_shotgun rules
+	// can see them. ev.Kind == EventUserMsg means PRIVMSG to a user,
+	// not a channel; ev.TargetNick is the recipient.
+	if ev.Kind == events.EventUserMsg && ev.TargetNick != "" {
+		u.recentUserMsg = append(u.recentUserMsg, userMsgRecord{
+			At: at, Target: ev.TargetNick, Text: ev.Text,
+		})
+		if len(u.recentUserMsg) > maxRecentMessages {
+			u.recentUserMsg = u.recentUserMsg[len(u.recentUserMsg)-maxRecentMessages:]
+		}
+	}
+	// Track mention bombs: chan msg containing >=3 distinct @-words.
+	if ev.Kind == events.EventChanMsg && countMentionTokens(ev.Text) >= 3 {
+		u.recentMentions = append(u.recentMentions, at)
+		if len(u.recentMentions) > maxRecentMessages {
+			u.recentMentions = u.recentMentions[len(u.recentMentions)-maxRecentMessages:]
+		}
 	}
 
 	rec := messageRecord{At: at, Channel: ev.Channel, Text: ev.Text, Hash: h}
@@ -168,6 +230,7 @@ func (u *userState) onJoin(ev *events.Event) {
 	if len(u.recentJoins) > maxRecentJoins {
 		u.recentJoins = u.recentJoins[1:]
 	}
+	u.recentHops = appendTimeBounded(u.recentHops, at, maxRecentEvents)
 }
 
 // onPart / onNick / onCTCP are similar bookkeeping for completeness.
@@ -176,6 +239,7 @@ func (u *userState) onPart(ev *events.Event) {
 	defer u.mu.Unlock()
 	u.touch(ev.At())
 	u.PartCount++
+	u.recentHops = appendTimeBounded(u.recentHops, ev.At(), maxRecentEvents)
 }
 
 func (u *userState) onNick(ev *events.Event) {
@@ -183,9 +247,18 @@ func (u *userState) onNick(ev *events.Event) {
 	defer u.mu.Unlock()
 	u.touch(ev.At())
 	u.NickCount++
+	u.recentNicks = appendTimeBounded(u.recentNicks, ev.At(), maxRecentEvents)
 	if ev.Nick != "" {
 		u.Nick = ev.Nick
 	}
+}
+
+func appendTimeBounded(s []time.Time, t time.Time, max int) []time.Time {
+	s = append(s, t)
+	if len(s) > max {
+		s = s[len(s)-max:]
+	}
+	return s
 }
 
 func (u *userState) onCTCP(ev *events.Event) {
@@ -278,6 +351,23 @@ func computeFeatures(u *userState, now time.Time) FeatureVector {
 	}
 	fv.CTCPCount = float64(u.CTCPCount)
 
+	// Nick-flip + hop rates over the same 60s window.
+	winStart = now.Add(-60 * time.Second)
+	nf := 0
+	for _, t := range u.recentNicks {
+		if !t.Before(winStart) {
+			nf++
+		}
+	}
+	hp := 0
+	for _, t := range u.recentHops {
+		if !t.Before(winStart) {
+			hp++
+		}
+	}
+	fv.NickFlipRate = float64(nf)
+	fv.HopRate = float64(hp)
+
 	return fv
 }
 
@@ -309,4 +399,40 @@ func countURLs(s string) int {
 		n += strings.Count(low, sub)
 	}
 	return n
+}
+
+// countMentionTokens returns the number of distinct @nick-style tokens
+// in the message. Used for mention-bomb detection. Conservative: only
+// counts tokens beginning with '@' or in IRC "nick:" leading style.
+func countMentionTokens(s string) int {
+	seen := map[string]bool{}
+	for _, raw := range strings.Fields(s) {
+		w := strings.TrimRight(raw, ",.:;!?)")
+		if strings.HasPrefix(w, "@") && len(w) > 1 {
+			seen[strings.ToLower(w[1:])] = true
+		} else if strings.HasSuffix(raw, ":") && len(raw) > 2 {
+			// "alice:" style addressing
+			seen[strings.ToLower(raw[:len(raw)-1])] = true
+		}
+	}
+	return len(seen)
+}
+
+// hasNickServSpoof reports whether the text contains a NickServ /
+// password-prompt social-engineering pattern. Common phishing in IRC.
+func hasNickServSpoof(s string) bool {
+	low := strings.ToLower(s)
+	// Any two of these phrases together is a strong signal.
+	hits := 0
+	for _, p := range []string{
+		"nickserv identify", "/msg nickserv", "msg nickserv id",
+		"identify your password", "verify your password",
+		"to confirm your account", "type /msg",
+		"your account has been compromised", "re-authenticate",
+	} {
+		if strings.Contains(low, p) {
+			hits++
+		}
+	}
+	return hits >= 1
 }
