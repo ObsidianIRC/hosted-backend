@@ -254,6 +254,13 @@ func (m *Manager) Observe(ev *events.Event) {
 	}
 	m.eventCount++
 
+	// Oper actions are strong supervised signals: train L3 against
+	// the target's current state, persist a feedback row, and stop.
+	if ev.IsOperLabel() {
+		m.learnFromOperAction(ev)
+		return
+	}
+
 	// Routing by event kind. Connect/register create/update user;
 	// quit removes; activity events update aggregates.
 	switch ev.Kind {
@@ -742,4 +749,103 @@ func parseIPv4(s string) []byte {
 	}
 	out[3] = byte(v)
 	return out
+}
+
+// learnFromOperAction folds a confirmed oper action (KILL, KICK by
+// oper, K/G/Z-line) into the training signal: the targeted user is
+// labeled malicious (1.0), persisted in the feedback store, and (if
+// L3 is wired) used as one SGD step against their current feature
+// vector.
+//
+// The "individual style" the user asked for emerges organically: as
+// opers consistently act on certain patterns, those features'
+// weights grow; patterns opers ignore stay weakly weighted. Over
+// time the L3 model mirrors the network's actual moderation style.
+func (m *Manager) learnFromOperAction(ev *events.Event) {
+	if ev == nil {
+		return
+	}
+	m.mu.RLock()
+	var u *userState
+	if ev.UID != "" {
+		u = m.users[ev.UID]
+	}
+	if u == nil && ev.Nick != "" {
+		if uid := m.byNick[ev.Nick]; uid != "" {
+			u = m.users[uid]
+		}
+	}
+	if u == nil && ev.Kind == events.EventOperKline {
+		// Kline targets a mask, not a uid -- find any live user
+		// whose user@host matches, since the kline applies to them.
+		u = m.findUserByMask(ev.TargetIdent, ev.TargetHost)
+	}
+	m.mu.RUnlock()
+
+	source := "oper"
+	if ev.Oper != "" {
+		source = "oper:" + ev.Oper
+	}
+	label := feedback.Label{
+		Verdict:   feedback.VerdictBad,
+		Source:    source,
+		AlertKind: string(ev.Kind),
+		Evidence:  ev.Reason,
+		At:        ev.At(),
+	}
+	if u != nil {
+		label.UID = u.UID
+		label.Nick = u.Nick
+	} else {
+		// Still useful as an audit row even without a matching live user.
+		label.Nick = ev.Nick
+	}
+
+	if m.feedback != nil {
+		if _, err := m.feedback.Record(label); err != nil {
+			log.Printf("[sentry] learnFromOperAction: feedback record failed: %v", err)
+		}
+		m.alertCount++
+	}
+	if m.classifier == nil || u == nil {
+		return
+	}
+	fv := featuresToMap(u.snapshotFeatures(ev.At()))
+	stacked := stackL1Features(fv, nil)
+	m.classifier.Train(stacked, 1.0)
+}
+
+// findUserByMask returns a tracked user whose ident matches usermask
+// AND host matches hostmask (literal compare; wildcard matching would
+// over-fit a kline that targets *.spam.example to every spam.example
+// user). Returns nil when nothing matches.
+func (m *Manager) findUserByMask(usermask, hostmask string) *userState {
+	if usermask == "" && hostmask == "" {
+		return nil
+	}
+	for _, u := range m.users {
+		if usermask != "" && !maskEqual(u.Ident, usermask) {
+			continue
+		}
+		if hostmask != "" && !maskEqual(u.Host, hostmask) {
+			continue
+		}
+		return u
+	}
+	return nil
+}
+
+// maskEqual matches with a trivial "*" wildcard at either end.
+// Anything more elaborate is left to the trainer's audit step.
+func maskEqual(actual, mask string) bool {
+	if mask == "*" {
+		return true
+	}
+	if len(mask) > 0 && mask[0] == '*' {
+		return len(actual) >= len(mask)-1 && actual[len(actual)-len(mask)+1:] == mask[1:]
+	}
+	if len(mask) > 0 && mask[len(mask)-1] == '*' {
+		return len(actual) >= len(mask)-1 && actual[:len(mask)-1] == mask[:len(mask)-1]
+	}
+	return actual == mask
 }
