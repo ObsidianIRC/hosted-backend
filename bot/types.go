@@ -14,8 +14,8 @@ const (
 	OpCommandRegister     = 20
 	OpInteractionResponse = 21
 	OpInteractionDefer    = 22
-	OpWorkflowEvent       = 30
 	OpSendMessage         = 31
+	OpSendTagmsg          = 32
 )
 
 type SendMessageD struct {
@@ -77,15 +77,11 @@ type CommandInvoke struct {
 }
 
 type InteractionResponse struct {
-	ID         string `json:"id"`
-	Content    string `json:"content"`
-	Visibility string `json:"visibility,omitempty"`
-	Ephemeral  bool   `json:"ephemeral,omitempty"`
-}
-
-type WorkflowEventOut struct {
-	Target  string          `json:"target"`
-	Payload json.RawMessage `json:"payload"`
+	ID         string            `json:"id"`
+	Content    string            `json:"content"`
+	Visibility string            `json:"visibility,omitempty"`
+	Ephemeral  bool              `json:"ephemeral,omitempty"`
+	Tags       map[string]string `json:"tags,omitempty"`
 }
 
 type WorkflowAction struct {

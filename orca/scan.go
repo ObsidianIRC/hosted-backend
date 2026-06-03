@@ -27,6 +27,7 @@ type scanFinding struct {
 }
 
 func (o *Orca) cmdScan(ctx context.Context, inv *bot.Invocation) error {
+	_ = inv.Defer()
 	channel := strings.TrimSpace(inv.String("channel"))
 	if channel == "" {
 		return inv.Whisper("scan: channel required.")

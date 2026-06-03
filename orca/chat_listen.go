@@ -27,10 +27,11 @@ func chatListenEnabled() bool {
 }
 
 // chatToolBudget caps tool round-trips for a chat-addressed query.
-// Same reasoning as voiceToolBudget: terse chat reply, low latency
-// budget. Bump to 5+ if responses are getting truncated for tool-heavy
-// asks like "audit who matches *@evil.example.com and ban them".
-const chatToolBudget = 4
+// Each iteration can carry several parallel tool calls, so the
+// effective tool count is roughly N × tools-per-iteration; 8 lines
+// up with the /ask budget and keeps tool-heavy "audit-and-ban" loops
+// from truncating mid-pass.
+const chatToolBudget = 8
 
 // addressMatcher decides whether a channel message is targeted at the
 // bot. Rule (per user request, simpler and more reliable than regex
@@ -258,6 +259,7 @@ func (o *Orca) runChatReply(ctx context.Context, channel, speaker, query, trigge
 	// a final answer, failed if it errors, exhausted at budget cap.
 	w := gw.NewWorkflow(channel, triggerMsgid, "chat:"+speaker)
 	_ = w.Start("interactive", "reasoning")
+	rs := w.ReasoningStart("Thinking")
 	defer func() {
 		if !w.IsTerminated() {
 			_ = w.Failed()
@@ -270,6 +272,10 @@ func (o *Orca) runChatReply(ctx context.Context, channel, speaker, query, trigge
 			Messages: messages,
 			Tools:    tools,
 		})
+		if iter == 0 && rs != nil {
+			_ = rs.Complete()
+			rs = nil
+		}
 		if err != nil {
 			log.Printf("[orca/chat] %s/%s: ask: %v", channel, speaker, err)
 			// Surface to the channel so the user knows we tried.
@@ -318,14 +324,17 @@ func (o *Orca) runChatReply(ctx context.Context, channel, speaker, query, trigge
 	}
 
 	if answer == "" {
-		return
+		answer = "(no reply)"
 	}
-	_ = w.Complete()
-	// Quote the speaker so the channel can tell who Orca's answering.
 	out := fmt.Sprintf("%s: %s", speaker, answer)
-	if err := gw.SendMessage(channel, out, false); err != nil {
+	if err := gw.SendMessageTagged(channel, out, false, w.TerminalReplyTags("complete")); err != nil {
 		log.Printf("[orca/chat] %s: SendMessage: %v", channel, err)
 	}
+	// Trailing standalone workflow:complete TAGMSG -- matches fluffilloo.
+	// The reply PRIVMSG/BATCH already carries +draft/bot-tools with
+	// state=complete, but the client also needs to see it as a bare
+	// TAGMSG to actually terminate the card.
+	_ = w.Complete()
 
 	go o.memory.MaybeCompact(context.Background(), conv)
 }

@@ -39,15 +39,19 @@ func (i *Invocation) Bool(name string) bool {
 }
 
 func (i *Invocation) Reply(content string) error {
-	return i.gw.sendInteractionResponse(i.ID, content, "", false)
+	return i.gw.sendInteractionResponse(i.ID, content, "", false, nil)
+}
+
+func (i *Invocation) ReplyTagged(content string, tags map[string]string) error {
+	return i.gw.sendInteractionResponse(i.ID, content, "", false, tags)
 }
 
 func (i *Invocation) ReplyPublic(content string) error {
-	return i.gw.sendInteractionResponse(i.ID, content, "public", false)
+	return i.gw.sendInteractionResponse(i.ID, content, "public", false, nil)
 }
 
 func (i *Invocation) Whisper(content string) error {
-	return i.gw.sendInteractionResponse(i.ID, content, "private", false)
+	return i.gw.sendInteractionResponse(i.ID, content, "private", false, nil)
 }
 
 func (i *Invocation) Defer() error {

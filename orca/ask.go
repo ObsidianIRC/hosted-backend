@@ -32,6 +32,11 @@ func (o *Orca) cmdAsk(ctx context.Context, inv *bot.Invocation) error {
 		return inv.Whisper("ask: query required.")
 	}
 
+	// Pushbot's initial interaction TTL is 3s; AI calls always exceed
+	// it. Defer immediately to buy 15s; we'll re-defer per tool loop
+	// below if the model keeps calling tools.
+	_ = inv.Defer()
+
 	convKey := ConvKey{}
 	if inv.Channel != "" {
 		convKey.Channel = inv.Channel
@@ -56,6 +61,7 @@ func (o *Orca) cmdAsk(ctx context.Context, inv *bot.Invocation) error {
 	if err := w.Start("interactive", "reasoning"); err != nil {
 		return err
 	}
+	rs := w.ReasoningStart("Thinking")
 
 	now := time.Now().UTC()
 	userTurn := ConvTurn{
@@ -75,10 +81,15 @@ func (o *Orca) cmdAsk(ctx context.Context, inv *bot.Invocation) error {
 	tools := o.aiTools()
 
 	for iter := 0; iter < maxToolIterations; iter++ {
+		_ = inv.Defer()
 		resp, err := o.chat.Chat(ctx, ai.ChatRequest{
 			Messages: messages,
 			Tools:    tools,
 		})
+		if iter == 0 && rs != nil {
+			_ = rs.Complete()
+			rs = nil
+		}
 		if err != nil {
 			_ = w.Failed()
 			return inv.Whisper("ask: " + err.Error())
@@ -99,9 +110,10 @@ func (o *Orca) cmdAsk(ctx context.Context, inv *bot.Invocation) error {
 			if reply == "" {
 				reply = "(no response)"
 			}
-			_ = w.Complete()
 			go o.memory.MaybeCompact(context.Background(), conv)
-			return inv.Reply(reply)
+			err := inv.ReplyTagged(reply, w.TerminalReplyTags("complete"))
+			_ = w.Complete() // trailing standalone TAGMSG -- see chat_listen
+			return err
 		}
 
 		// Add the assistant message that called the tools.

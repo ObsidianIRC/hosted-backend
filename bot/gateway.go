@@ -176,30 +176,39 @@ func (g *Gateway) send(f Frame) error {
 	return conn.WriteJSON(f)
 }
 
-func (g *Gateway) sendInteractionResponse(id, content, vis string, ephemeral bool) error {
+func (g *Gateway) sendInteractionResponse(id, content, vis string, ephemeral bool, tags map[string]string) error {
 	d, _ := json.Marshal(InteractionResponse{
 		ID:         id,
 		Content:    content,
 		Visibility: vis,
 		Ephemeral:  ephemeral,
+		Tags:       tags,
 	})
 	return g.send(Frame{Op: OpInteractionResponse, D: d})
 }
 
-func (g *Gateway) sendWorkflowEvent(target string, payload json.RawMessage) error {
-	d, _ := json.Marshal(WorkflowEventOut{Target: target, Payload: payload})
-	return g.send(Frame{Op: OpWorkflowEvent, D: d})
+func (g *Gateway) sendTagmsg(target string, tags map[string]string) error {
+	d, _ := json.Marshal(struct {
+		Target string            `json:"target"`
+		Tags   map[string]string `json:"tags"`
+	}{target, tags})
+	return g.send(Frame{Op: OpSendTagmsg, D: d})
 }
 
-// SendMessage sends a spontaneous PRIVMSG (or NOTICE if isNotice) from
-// the bot's ghost to `target`. Target may be a channel (#/&/^/$) or a
-// nick. Doesn't piggyback on any interaction -- the bot is the source.
 func (g *Gateway) SendMessage(target, content string, isNotice bool) error {
-	d, _ := json.Marshal(SendMessageD{
-		Target:   target,
-		Content:  content,
-		IsNotice: isNotice,
-	})
+	return g.SendMessageTagged(target, content, isNotice, nil)
+}
+
+// SendMessageTagged attaches client-only tags (e.g. +draft/bot-tools,
+// +draft/reply) to the outgoing PRIVMSG/NOTICE. Each tag name MUST
+// begin with '+'.
+func (g *Gateway) SendMessageTagged(target, content string, isNotice bool, tags map[string]string) error {
+	d, _ := json.Marshal(struct {
+		Target   string            `json:"target"`
+		Content  string            `json:"content"`
+		IsNotice bool              `json:"is_notice,omitempty"`
+		Tags     map[string]string `json:"tags,omitempty"`
+	}{target, content, isNotice, tags})
 	return g.send(Frame{Op: OpSendMessage, D: d})
 }
 

@@ -30,6 +30,7 @@ type maskCandidate struct {
 }
 
 func (o *Orca) cmdSynthBan(ctx context.Context, inv *bot.Invocation) error {
+	_ = inv.Defer()
 	nick := strings.TrimSpace(inv.String("nick"))
 	if nick == "" {
 		return inv.Whisper("synth-ban: nick required.")

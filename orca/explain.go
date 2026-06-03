@@ -20,6 +20,7 @@ var explainCommand = bot.Command{
 }
 
 func (o *Orca) cmdExplain(ctx context.Context, inv *bot.Invocation) error {
+	_ = inv.Defer()
 	maskStr := strings.TrimSpace(inv.String("mask"))
 	if maskStr == "" {
 		return inv.Whisper("explain: mask required.")

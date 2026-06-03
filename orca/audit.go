@@ -21,6 +21,7 @@ var auditCommand = bot.Command{
 }
 
 func (o *Orca) cmdAudit(ctx context.Context, inv *bot.Invocation) error {
+	_ = inv.Defer()
 	target := strings.TrimSpace(inv.String("target"))
 	if target == "" {
 		return inv.Whisper("audit: target required.")
