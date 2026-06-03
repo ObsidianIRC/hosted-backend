@@ -114,6 +114,10 @@ func (o *Orca) registerCommands() {
 	o.registerCommand(explainCommand, o.cmdExplain)
 	o.registerCommand(synthBanCommand, o.cmdSynthBan)
 	o.registerCommand(askCommand, o.cmdAsk)
+	o.registerCommand(sentryStatusCommand, o.cmdSentryStatus)
+	o.registerCommand(sentryExplainCommand, o.cmdSentryExplain)
+	o.registerCommand(sentryLabelCommand, o.cmdSentryLabel)
+	o.registerCommand(sentryRecentCommand, o.cmdSentryRecent)
 }
 
 func (o *Orca) OnInvoke(ctx context.Context, inv *bot.Invocation) error {

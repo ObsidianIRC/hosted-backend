@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"backend/orca"
-	"backend/sentrybot"
 
 	"github.com/disintegration/imaging"
 	"github.com/gorilla/mux"
@@ -231,9 +230,6 @@ func main() {
 	}
 	if _, err := orca.Start(orcaCtx, ircAdapter{}, orcaVoice); err != nil {
 		fmt.Printf("orca: %v\n", err)
-	}
-	if _, err := sentrybot.Start(orcaCtx); err != nil {
-		fmt.Printf("sentrybot: %v\n", err)
 	}
 
 	r := mux.NewRouter()
