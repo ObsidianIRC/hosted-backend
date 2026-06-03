@@ -83,6 +83,13 @@ func (w *WorkflowEmitter) Complete() error {
 	return w.WorkflowState("complete")
 }
 
+func (w *WorkflowEmitter) IsTerminated() bool {
+	if w == nil {
+		return true
+	}
+	return w.terminated.Load()
+}
+
 func (w *WorkflowEmitter) Failed() error {
 	return w.WorkflowState("failed")
 }

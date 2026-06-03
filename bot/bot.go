@@ -62,6 +62,15 @@ func (i *Invocation) NewWorkflow(name string) *WorkflowEmitter {
 	return newWorkflowEmitter(i.gw, target, i.Msgid, name)
 }
 
+// NewWorkflow builds an emitter for callers without an Invocation
+// (e.g. Orca's chat-listen path responding to a PRIVMSG it wasn't
+// formally invoked by). target is the channel-or-nick the workflow
+// renders in; trigger is the msgid that should anchor the floating
+// card to the user's message.
+func (g *Gateway) NewWorkflow(target, trigger, name string) *WorkflowEmitter {
+	return newWorkflowEmitter(g, target, trigger, name)
+}
+
 type Bot interface {
 	Nick() string
 	Token() string

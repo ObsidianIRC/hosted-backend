@@ -205,7 +205,7 @@ func (o *Orca) handleChannelMessage(ctx context.Context, m bot.MessageCreate) {
 		return
 	}
 
-	go o.runChatReply(ctx, channel, speaker, query)
+	go o.runChatReply(ctx, channel, speaker, query, m.Msgid)
 }
 
 // addressMatcher lazily builds the matcher once and caches it. Nick
@@ -222,7 +222,7 @@ func (o *Orca) addressMatcher() *addressMatcher {
 // runChatReply is the per-message worker: same tool-loop shape as
 // askPlain but tuned for chat (text output, longer context budget, no
 // TTS). Posts the reply with SendMessage.
-func (o *Orca) runChatReply(ctx context.Context, channel, speaker, query string) {
+func (o *Orca) runChatReply(ctx context.Context, channel, speaker, query, triggerMsgid string) {
 	gw := o.Gateway()
 	if gw == nil {
 		log.Printf("[orca/chat] %s/%s: no gateway, can't reply", channel, speaker)
@@ -252,6 +252,17 @@ func (o *Orca) runChatReply(ctx context.Context, channel, speaker, query string)
 
 	messages := o.memory.BuildMessages(conv, sysPrompt, speakerNote, "")
 	tools := o.aiTools()
+
+	// Workflow card for the floating bot-tools UI. Lifetime is the
+	// whole tool-call loop; we mark complete when the model returns
+	// a final answer, failed if it errors, exhausted at budget cap.
+	w := gw.NewWorkflow(channel, triggerMsgid, "chat:"+speaker)
+	_ = w.Start("interactive", "reasoning")
+	defer func() {
+		if !w.IsTerminated() {
+			_ = w.Failed()
+		}
+	}()
 
 	var answer string
 	for iter := 0; iter < chatToolBudget; iter++ {
@@ -289,7 +300,7 @@ func (o *Orca) runChatReply(ctx context.Context, channel, speaker, query string)
 			if tc.Function.Arguments != "" {
 				_ = json.Unmarshal([]byte(tc.Function.Arguments), &params)
 			}
-			result, terr := o.invokeAITool(ctx, tc.Function.Name, params, nil)
+			result, terr := o.invokeAITool(ctx, tc.Function.Name, params, w)
 			if terr != nil {
 				result = fmt.Sprintf(`{"error":%q}`, terr.Error())
 			}
@@ -309,6 +320,7 @@ func (o *Orca) runChatReply(ctx context.Context, channel, speaker, query string)
 	if answer == "" {
 		return
 	}
+	_ = w.Complete()
 	// Quote the speaker so the channel can tell who Orca's answering.
 	out := fmt.Sprintf("%s: %s", speaker, answer)
 	if err := gw.SendMessage(channel, out, false); err != nil {
