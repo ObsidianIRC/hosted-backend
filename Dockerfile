@@ -3,7 +3,7 @@
 # obby-api / hosted-backend image -- REST + JWT + WebRTC SFU + TURN.
 # CGO_ENABLED=1 is required because mattn/go-sqlite3 ships as cgo.
 #
-# Build:   docker build -t obbyirc/obby-api .
+# Build:   docker build -t obbyworld/obby-api .
 # Compose: docker compose up -d
 
 FROM golang:1.25-alpine AS builder
