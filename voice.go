@@ -19,14 +19,17 @@ package main
 
 import (
 	"crypto/hmac"
+	cryptorand "crypto/rand"
 	"crypto/sha1"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
 	"net"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -304,6 +307,23 @@ type signalEnvelope struct {
 	// audio/video/screen track belongs to. We ship an explicit map
 	// alongside the server-pushed "offer".
 	Tracks []TrackHint `json:"tracks,omitempty"`
+
+	// Stream-channel ($-prefix) role bookkeeping.
+	//
+	// Mode is "voice" for ^-channels (everyone publishes) or "stream"
+	// for $-channels (only streamers publish; viewers chat-only).
+	// Sent on the "joined" reply so the client can configure its UI
+	// before any media flows.
+	Mode string `json:"mode,omitempty"`
+	// Role: "streamer" | "viewer". Sent in `joined` for the joiner's
+	// own role and in `role` envelopes for peers whose role changed.
+	Role string `json:"role,omitempty"`
+	// Snapshot of streamer nicks in the room, in join order. Sent in
+	// `joined` so the client knows who is publishing right now.
+	Streamers []string `json:"streamers,omitempty"`
+	// Promote target nick (envelope Type "promote") -- streamer-only,
+	// caps the room at 4 concurrent streamers. "demote" mirrors it.
+	Target string `json:"target,omitempty"`
 }
 
 // TrackHint tells the receiving client which member + kind a given
@@ -322,6 +342,24 @@ type voiceRoom struct {
 	name  string
 	peers map[string]*voicePeer // keyed by nick
 	mu    sync.RWMutex
+	// "voice" for ^-channels, "stream" for $-channels. Set on creation
+	// from the channel-name prefix and never changes for the room's
+	// lifetime.
+	mode string
+	// In-process participants (see voice_local.go). Bot ghosts and any
+	// future server-side audio consumer slot in here and bypass WebRTC.
+	localPeers map[string]*voiceLocalPeer
+}
+
+// streamMaxStreamers caps how many co-streamers a $-channel can have at
+// once. The host counts as one; promotions beyond this fail.
+const streamMaxStreamers = 4
+
+func roomModeFor(channel string) string {
+	if strings.HasPrefix(channel, "$") {
+		return "stream"
+	}
+	return "voice"
 }
 
 func (r *voiceRoom) snapshotMembers() []string {
@@ -351,6 +389,13 @@ type voicePeer struct {
 	// Senders we've added to this peer's PC, keyed by the publisher's
 	// localID; used to remove on leave / cleanup.
 	subSenders map[string]*webrtc.RTPSender
+	// "streamer" | "viewer". In "voice" rooms every peer is a streamer.
+	// In "stream" rooms the first joiner is streamer, subsequent peers
+	// are viewers until promoted by an existing streamer.
+	role string
+	// Server-side join time, used for deterministic auto-promotion when
+	// every streamer leaves a $-channel.
+	joinedAt time.Time
 }
 
 type voiceManager struct {
@@ -362,6 +407,11 @@ type voiceManager struct {
 	// signalEnvelopes that need to land at a client funnel through
 	// here so the bridge can serialize -> JSON-tag -> TAGMSG.
 	outbound func(target, payload string) error
+	// Nicks that are expected to attach as local (in-process) participants
+	// for a given channel. Populated by RegisterLocal; consulted by
+	// handleJoin to skip PC creation when the IRC join arrives.
+	localMu       sync.RWMutex
+	localExpected map[string]map[string]bool
 }
 
 func newVoiceManager(cfg VoiceConfig) *voiceManager {
@@ -414,15 +464,42 @@ func (m *voiceManager) getOrCreateRoom(name string) *voiceRoom {
 	if r, ok := m.rooms[name]; ok {
 		return r
 	}
-	r := &voiceRoom{name: name, peers: map[string]*voicePeer{}}
+	r := &voiceRoom{
+		name:  name,
+		peers: map[string]*voicePeer{},
+		mode:  roomModeFor(name),
+	}
 	m.rooms[name] = r
 	return r
+}
+
+// streamersUnsafe returns the room's current streamers in join order.
+// Caller holds room.mu.
+func (r *voiceRoom) streamersUnsafe() []*voicePeer {
+	out := make([]*voicePeer, 0, len(r.peers))
+	for _, p := range r.peers {
+		if p.role == "streamer" {
+			out = append(out, p)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].joinedAt.Before(out[j].joinedAt)
+	})
+	return out
+}
+
+func streamerNicks(peers []*voicePeer) []string {
+	out := make([]string, 0, len(peers))
+	for _, p := range peers {
+		out = append(out, p.nick)
+	}
+	return out
 }
 
 func (m *voiceManager) reapEmpty(name string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if r, ok := m.rooms[name]; ok && len(r.peers) == 0 {
+	if r, ok := m.rooms[name]; ok && len(r.peers) == 0 && len(r.localPeers) == 0 {
 		delete(m.rooms, name)
 	}
 }
@@ -430,8 +507,15 @@ func (m *voiceManager) reapEmpty(name string) {
 // handleJoin allocates a peer, opens a PeerConnection on the server
 // side, and replies with a "joined" envelope plus TURN creds.
 func (m *voiceManager) handleJoin(nick, channel, account string) {
-	if !strings.HasPrefix(channel, "^") {
-		m.send(nick, signalEnvelope{Type: "error", Error: "not a voice channel"})
+	if !strings.HasPrefix(channel, "^") && !strings.HasPrefix(channel, "$") {
+		m.send(nick, signalEnvelope{Type: "error",
+			Error: "not a voice or stream channel"})
+		return
+	}
+	if m.isLocalExpected(channel, nick) {
+		// In-process participant; the LocalPeer is created via
+		// RegisterLocal, not via signaling. Don't allocate a PC.
+		log.Printf("voice: %s is a local participant in %s; skip PC", nick, channel)
 		return
 	}
 	room := m.getOrCreateRoom(channel)
@@ -459,15 +543,32 @@ func (m *voiceManager) handleJoin(nick, channel, account string) {
 		mgr:        m,
 		pc:         pc,
 		subSenders: map[string]*webrtc.RTPSender{},
+		joinedAt:   time.Now(),
+	}
+	// Role assignment by room mode.
+	//   voice (^):  every peer publishes -> all "streamer".
+	//   stream ($): only the first joiner streams; everyone else is a
+	//               viewer until promoted by an existing streamer.
+	if room.mode == "stream" {
+		peer.role = "viewer"
+		if len(room.streamersUnsafe()) == 0 {
+			peer.role = "streamer"
+		}
+	} else {
+		peer.role = "streamer"
 	}
 	room.peers[nick] = peer
-	members := make([]string, 0, len(room.peers))
+	members := make([]string, 0, len(room.peers)+len(room.localPeers))
 	for n := range room.peers {
 		if n == nick {
 			continue
 		}
 		members = append(members, n)
 	}
+	for n := range room.localPeers {
+		members = append(members, n)
+	}
+	streamers := streamerNicks(room.streamersUnsafe())
 	room.mu.Unlock()
 
 	// Subscribe to existing peers' tracks (so this new peer hears
@@ -482,7 +583,53 @@ func (m *voiceManager) handleJoin(nick, channel, account string) {
 				nick, other.nick, err)
 		}
 	}
+	// Also subscribe to in-process local peers' tracks so the very
+	// first packet they send (e.g. Orca's TTS reply) arrives on a
+	// track that's already in this peer's initial offer -- no
+	// mid-stream renegotiation, no chopped-off first 200 ms.
+	localPeers := make([]*voiceLocalPeer, 0, len(room.localPeers))
+	for _, lp := range room.localPeers {
+		localPeers = append(localPeers, lp)
+	}
 	room.mu.RUnlock()
+	for _, lp := range localPeers {
+		lp.mu.Lock()
+		audioTrack := lp.audio
+		videoTrack := lp.video
+		lp.mu.Unlock()
+		for _, track := range []*webrtc.TrackLocalStaticRTP{audioTrack, videoTrack} {
+			if track == nil {
+				continue
+			}
+			s, err := pc.AddTrack(track)
+			if err != nil {
+				log.Printf("voice: subscribe %s -> local %s: %v",
+					nick, lp.nick, err)
+				continue
+			}
+			peer.mu.Lock()
+			if peer.subSenders == nil {
+				peer.subSenders = map[string]*webrtc.RTPSender{}
+			}
+			peer.subSenders[track.ID()] = s
+			peer.mu.Unlock()
+		}
+	}
+	// Local peers broadcast mic-on at registration time, which is
+	// BEFORE any client is in the room. New joiners would therefore
+	// see them as muted in the UI. Send mic-on DIRECTLY to the new
+	// joiner (not broadcast) so it arrives in order AFTER the joined
+	// envelope -- broadcasts can race with onJoined, which rebuilds
+	// the members map from blank and clobbers any prior state.
+	for _, lp := range localPeers {
+		m.send(nick, signalEnvelope{
+			Type:    "presence",
+			Member:  lp.nick,
+			State:   "on",
+			Kind:    "mic",
+			Channel: channel,
+		})
+	}
 
 	// Hook ICE candidate emission so we relay them back to the client.
 	pc.OnICECandidate(func(c *webrtc.ICECandidate) {
@@ -514,21 +661,27 @@ func (m *voiceManager) handleJoin(nick, channel, account string) {
 	})
 
 	turn := mintTurnCreds(m.cfg, account, 6*time.Hour)
+	log.Printf("voice: sending joined to %s in %s members=%v", nick, channel, members)
 	m.send(nick, signalEnvelope{
-		Type:    "joined",
-		Channel: channel,
-		Members: members,
-		TURN:    &turn,
-		Tracks:  peer.trackHints(),
+		Type:      "joined",
+		Channel:   channel,
+		Members:   members,
+		TURN:      &turn,
+		Tracks:    peer.trackHints(),
+		Mode:      room.mode,
+		Role:      peer.role,
+		Streamers: streamers,
 	})
 
 	// Tell every other peer that someone joined (presence broadcast,
-	// not media-bearing).
+	// not media-bearing). Role rides along so viewers' clients can lay
+	// out new arrivals correctly without an extra round-trip.
 	m.broadcast(channel, nick, signalEnvelope{
 		Type:    "presence",
 		Member:  nick,
 		State:   "joined",
 		Channel: channel,
+		Role:    peer.role,
 	})
 }
 
@@ -555,6 +708,18 @@ func (p *voicePeer) subscribeTo(other *voicePeer) error {
 // into the local fan-out track so all other peers' senders receive
 // them.  The local fan-out track is created lazily on first packet.
 func (p *voicePeer) fanOutTrack(remote *webrtc.TrackRemote) {
+	// Stream-channel viewers are chat-only -- they can't push media
+	// to the room. If a viewer's client tries (via a misbehaving build
+	// or browser quirk), drop the inbound track silently rather than
+	// fan it out to other peers.
+	p.mu.Lock()
+	role := p.role
+	p.mu.Unlock()
+	if p.room != nil && p.room.mode == "stream" && role != "streamer" {
+		log.Printf("voice: dropping track from viewer %s in $%s",
+			p.nick, p.room.name)
+		return
+	}
 	kind := remote.Kind().String()
 	codec := remote.Codec()
 	// Use the remote track's id as a uniqueness suffix so a publisher
@@ -719,6 +884,9 @@ func (p *voicePeer) fanOutTrack(remote *webrtc.TrackRemote) {
 				return
 			}
 		}
+		if p.room != nil {
+			p.room.notifyLocalPeers(p.nick, kind, buf[:n])
+		}
 	}
 }
 
@@ -758,6 +926,25 @@ func (m *voiceManager) handleLeave(nick, channel string) {
 		other.mu.Unlock()
 	}
 	empty := len(room.peers) == 0
+	// Stream-channel: if every streamer just left, hand the role to
+	// the longest-tenured remaining viewer so the channel doesn't
+	// silently brick. Returning the promoted nick lets us broadcast
+	// the role transition outside the lock.
+	var promoted *voicePeer
+	if !empty && room.mode == "stream" &&
+		peer.role == "streamer" &&
+		len(room.streamersUnsafe()) == 0 {
+		var oldest *voicePeer
+		for _, p := range room.peers {
+			if oldest == nil || p.joinedAt.Before(oldest.joinedAt) {
+				oldest = p
+			}
+		}
+		if oldest != nil {
+			oldest.role = "streamer"
+			promoted = oldest
+		}
+	}
 	room.mu.Unlock()
 
 	peer.close()
@@ -768,6 +955,15 @@ func (m *voiceManager) handleLeave(nick, channel string) {
 		State:   "left",
 		Channel: channel,
 	})
+
+	if promoted != nil {
+		m.broadcast(channel, "", signalEnvelope{
+			Type:    "role",
+			Member:  promoted.nick,
+			Role:    "streamer",
+			Channel: channel,
+		})
+	}
 
 	if empty {
 		m.reapEmpty(channel)
@@ -996,6 +1192,97 @@ func (m *voiceManager) handleReaction(nick, channel string, env signalEnvelope) 
 	})
 }
 
+// handlePromote: an existing streamer in a $-channel asks to promote
+// `target` to streamer. Hard cap of streamMaxStreamers concurrent
+// streamers; over the cap or unauthorized requests reflect an "error"
+// envelope back to the requester. On success we broadcast a "role"
+// envelope so every client (including viewers) can update its UI.
+func (m *voiceManager) handlePromote(nick, channel string, env signalEnvelope) {
+	target := strings.TrimSpace(env.Target)
+	if target == "" {
+		return
+	}
+	room, peer := m.lookup(nick, channel)
+	if room == nil || peer == nil {
+		return
+	}
+	if room.mode != "stream" {
+		return
+	}
+	room.mu.Lock()
+	if peer.role != "streamer" {
+		room.mu.Unlock()
+		m.send(nick, signalEnvelope{Type: "error",
+			Error: "only streamers can promote"})
+		return
+	}
+	tp, ok := room.peers[target]
+	if !ok || tp.role == "streamer" {
+		room.mu.Unlock()
+		return
+	}
+	if len(room.streamersUnsafe()) >= streamMaxStreamers {
+		room.mu.Unlock()
+		m.send(nick, signalEnvelope{Type: "error",
+			Error: fmt.Sprintf("max %d streamers", streamMaxStreamers)})
+		return
+	}
+	tp.role = "streamer"
+	room.mu.Unlock()
+	m.broadcast(channel, "", signalEnvelope{
+		Type:    "role",
+		Member:  target,
+		Role:    "streamer",
+		Channel: channel,
+	})
+}
+
+// handleDemote: a streamer can demote themselves OR another streamer
+// back to viewer. The host (oldest streamer) can demote anyone; others
+// can only demote themselves. We don't auto-promote here -- demotion
+// shrinks the streamer list cleanly.
+func (m *voiceManager) handleDemote(nick, channel string, env signalEnvelope) {
+	target := strings.TrimSpace(env.Target)
+	if target == "" {
+		target = nick
+	}
+	room, peer := m.lookup(nick, channel)
+	if room == nil || peer == nil {
+		return
+	}
+	if room.mode != "stream" {
+		return
+	}
+	room.mu.Lock()
+	tp, ok := room.peers[target]
+	if !ok || tp.role != "streamer" {
+		room.mu.Unlock()
+		return
+	}
+	streamers := room.streamersUnsafe()
+	host := ""
+	if len(streamers) > 0 {
+		host = streamers[0].nick
+	}
+	if target != nick && nick != host {
+		room.mu.Unlock()
+		m.send(nick, signalEnvelope{Type: "error",
+			Error: "only the host can demote others"})
+		return
+	}
+	tp.role = "viewer"
+	// If the demoted peer was the host and others remain, the next
+	// oldest streamer becomes the implicit host (no explicit role
+	// change needed -- streamersUnsafe returns join order).
+	room.mu.Unlock()
+	m.broadcast(channel, "", signalEnvelope{
+		Type:    "role",
+		Member:  target,
+		Role:    "viewer",
+		Channel: channel,
+	})
+}
+
 func (m *voiceManager) handleState(nick, channel string, env signalEnvelope) {
 	// State (mute/cam/speaking/hand/etc) is presence -- rebroadcast
 	// to everyone in the room. We forward env.Type as Kind so the
@@ -1032,6 +1319,18 @@ func (m *voiceManager) send(target string, env signalEnvelope) {
 	if m.outbound == nil {
 		return
 	}
+	// Chunk SDP-bearing envelopes (offer / answer) so the IRCd's
+	// TAGMSG line stays under MAXTAGSIZE=8192 after the JSON+IRC-tag
+	// escape roundtrip. CR/LF in raw SDP go 1 -> 3 on the wire so the
+	// safe raw-byte ceiling is well under 3000; we use 2000 to leave
+	// headroom for the wrapper JSON ("type", "id", "seq", "total",
+	// optional "tracks" hints) and any future field additions without
+	// having to revisit this constant.
+	if (env.Type == "offer" || env.Type == "answer") &&
+		len(env.SDP) > sdpChunkRawLimit {
+		m.sendChunked(target, env)
+		return
+	}
 	payload, err := json.Marshal(env)
 	if err != nil {
 		return
@@ -1039,6 +1338,60 @@ func (m *voiceManager) send(target string, env signalEnvelope) {
 	if err := m.outbound(target, string(payload)); err != nil {
 		log.Printf("voice: outbound to %s: %v", target, err)
 	}
+}
+
+const sdpChunkRawLimit = 2000
+
+// sendChunked splits an oversized SDP into N envelopes, each carrying
+// a slice of the SDP plus shared id and sequential seq/total. The
+// receiving client reassembles via SignalEnvelope.id before applying
+// the offer/answer. Track hints ride with chunk 0 only -- they're a
+// small map and resending them on every chunk would just inflate the
+// other chunks for no benefit.
+func (m *voiceManager) sendChunked(target string, env signalEnvelope) {
+	full := env.SDP
+	id := chunkID()
+	total := (len(full) + sdpChunkRawLimit - 1) / sdpChunkRawLimit
+	for seq := 0; seq < total; seq++ {
+		start := seq * sdpChunkRawLimit
+		end := start + sdpChunkRawLimit
+		if end > len(full) {
+			end = len(full)
+		}
+		seqVal := seq
+		totalVal := total
+		chunk := signalEnvelope{
+			Type:    env.Type,
+			SDP:     full[start:end],
+			ChunkID: id,
+			Seq:     &seqVal,
+			Total:   &totalVal,
+		}
+		// Keep track-attribution hints with chunk 0 -- the first chunk
+		// is enough for the client to learn the mapping before the
+		// reassembled offer/answer is applied.
+		if seq == 0 {
+			chunk.Tracks = env.Tracks
+		}
+		payload, err := json.Marshal(chunk)
+		if err != nil {
+			return
+		}
+		if err := m.outbound(target, string(payload)); err != nil {
+			log.Printf("voice: outbound chunk %d/%d to %s: %v",
+				seq+1, total, target, err)
+			return
+		}
+	}
+}
+
+// chunkID returns a short random identifier shared across chunks of
+// one logical envelope so the client can group them in its inbound
+// reassembly buffer.
+func chunkID() string {
+	var b [6]byte
+	_, _ = cryptorand.Read(b[:])
+	return hex.EncodeToString(b[:])
 }
 
 // broadcast sends to everyone in `channel` except optional excludeNick.

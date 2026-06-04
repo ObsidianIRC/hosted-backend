@@ -228,6 +228,10 @@ func (b *voiceBridge) dispatch(f bridgeFrame) {
 			b.mgr.handleState(f.From, f.Channel, env)
 		case "react":
 			b.mgr.handleReaction(f.From, f.Channel, env)
+		case "promote":
+			b.mgr.handlePromote(f.From, f.Channel, env)
+		case "demote":
+			b.mgr.handleDemote(f.From, f.Channel, env)
 		default:
 			log.Printf("voice: unknown signal type %q", env.Type)
 		}
@@ -288,25 +292,28 @@ func (b *voiceBridge) send(target, payload string) error {
 	return nil
 }
 
-// startVoiceSubsystem boots TURN + bridge.  Returns a teardown func.
-// Errors from individual sub-systems are logged but don't fail the
-// whole backend; if VOICE_TURN_SECRET isn't set we simply skip voice
-// initialization.
-func startVoiceSubsystem(ctx context.Context) func() {
+// startVoiceSubsystem boots TURN + bridge.  Returns the manager (so
+// in-process consumers can register LocalParticipants) and a teardown
+// func. Errors from individual sub-systems are logged but don't fail
+// the whole backend; if VOICE_TURN_SECRET isn't set we simply skip
+// voice initialization and return (nil, no-op).
+func startVoiceSubsystem(ctx context.Context) (*voiceManager, func()) {
 	cfg := loadVoiceConfig()
 	if cfg.TurnAuthSecret == "" {
 		log.Printf("voice: VOICE_TURN_SECRET unset; voice subsystem disabled")
-		return func() {}
+		return nil, func() {}
 	}
 
 	var turnSrv *turn.Server
 	if cfg.DisableEmbeddedTurn {
 		log.Printf("voice: VOICE_TURN_DISABLE_EMBEDDED set; not starting embedded TURN")
 	} else {
-		s, err := startTurnServer(cfg)
+		
+
+	s, err := startTurnServer(cfg)
 		if err != nil {
 			log.Printf("voice: TURN startup: %v", err)
-			return func() {}
+			return nil, func() {}
 		}
 		turnSrv = s
 	}
@@ -319,7 +326,7 @@ func startVoiceSubsystem(ctx context.Context) func() {
 		}
 	}()
 
-	return func() {
+	return mgr, func() {
 		if turnSrv == nil {
 			return
 		}

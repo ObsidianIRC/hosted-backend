@@ -16,6 +16,8 @@ import (
 	"strings"
 	"time"
 
+	"backend/orca"
+
 	"github.com/disintegration/imaging"
 	"github.com/gorilla/mux"
 	"github.com/joho/godotenv"
@@ -203,22 +205,49 @@ func main() {
 		// Continue without IRC features
 	}
 
+	// Web Push (soju.im/webpush): load/generate the VAPID keypair so
+	// /push/vapid-key and /push/send can serve obbyircd.
+	if err := InitWebPush(); err != nil {
+		fmt.Printf("Failed to initialize web push: %v\n", err)
+		// Continue without push features
+	}
+
 	// Voice subsystem: embedded TURN + WebRTC SFU + Unix-socket
 	// bridge for obbyircd's voice-channels module.  No-ops with a
 	// log line if VOICE_TURN_SECRET is unset.
 	voiceCtx, voiceCancel := context.WithCancel(context.Background())
-	voiceShutdown := startVoiceSubsystem(voiceCtx)
+	voiceMgr, voiceShutdown := startVoiceSubsystem(voiceCtx)
 	defer func() {
 		voiceCancel()
 		voiceShutdown()
 	}()
 
+	orcaCtx, orcaCancel := context.WithCancel(context.Background())
+	defer orcaCancel()
+	var orcaVoice orca.LocalParticipantAPI
+	if voiceMgr != nil {
+		orcaVoice = voiceAPIAdapter{mgr: voiceMgr}
+	}
+	if _, err := orca.Start(orcaCtx, ircAdapter{}, orcaVoice); err != nil {
+		fmt.Printf("orca: %v\n", err)
+	}
+
 	r := mux.NewRouter()
 
-	// File upload (requires JWT)
-	r.HandleFunc("/upload", AuthMiddleware(func(w http.ResponseWriter, r *http.Request) {
+	// OAuth2 token-endpoint CORS proxy. Browsers can't POST directly to
+	// GitHub's /login/oauth/access_token (no Allow-Origin header). The
+	// SPA hits POST /oauth/exchange/<provider> here and we relay to the
+	// upstream URL configured via OAUTH_PROXY_<PROVIDER> in .env.
+	r.HandleFunc("/oauth/exchange/{provider}", handleOAuthExchange).
+		Methods("POST", "OPTIONS")
+
+	// File upload (requires a draft/authtoken bearer minted by
+	// obbyircd's `TOKEN GENERATE filehost`).  AuthTokenMiddleware
+	// burns the token on validate -- one upload per token, matching
+	// the spec's single-use semantic.
+	r.HandleFunc("/upload", AuthTokenMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		uploadHandler(w, r, port, deleteTimeout, mediaCfg, imageCompressionEnabled, imageMaxWidth, imageMaxHeight, imageJpegQuality, imageConvertToJpeg)
-	}, false)).Methods("POST", "OPTIONS")
+	})).Methods("POST", "OPTIONS")
 
 	// Public upload-policy discovery so clients can pre-validate
 	// before pushing bytes.  No auth required: the policy is the
@@ -239,19 +268,22 @@ func main() {
 		})
 	}).Methods("GET", "OPTIONS")
 
-	// Avatar uploads (require JWT)
-	r.HandleFunc("/upload/avatar/user", AuthMiddleware(func(w http.ResponseWriter, r *http.Request) {
+	// Avatar uploads — same draft/authtoken flow as /upload.
+	r.HandleFunc("/upload/avatar/user", AuthTokenMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		uploadUserAvatarHandler(w, r, maxUploadSize, imageCompressionEnabled, imageMaxWidth, imageMaxHeight, imageJpegQuality, imageConvertToJpeg)
-	}, false)).Methods("POST", "OPTIONS")
+	})).Methods("POST", "OPTIONS")
 
-	r.HandleFunc("/upload/avatar/channel/{channel}", AuthMiddleware(func(w http.ResponseWriter, r *http.Request) {
+	r.HandleFunc("/upload/avatar/channel/{channel}", AuthTokenMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		uploadChannelAvatarHandler(w, r, maxUploadSize, imageCompressionEnabled, imageMaxWidth, imageMaxHeight, imageJpegQuality, imageConvertToJpeg)
-	}, false)).Methods("POST", "OPTIONS")
+	})).Methods("POST", "OPTIONS")
 
 	// Image serving (kept for back-compat with old links)
 	r.PathPrefix("/images/").Handler(corsHandler(http.StripPrefix("/images/", http.FileServer(http.Dir("images")))))
 	// Generic media serving (videos, audio, and new image uploads)
 	r.PathPrefix("/uploads/").Handler(corsHandler(http.StripPrefix("/uploads/", http.FileServer(http.Dir(uploadsDir)))))
+
+	// draft/custom-emoji: public pack JSON + admin CRUD (oper-only).
+	registerEmojiRoutes(r)
 
 	// IRC info endpoints (require JWT + IRCop)
 	r.HandleFunc("/irc/users", AuthMiddleware(handleIRCUsers, true)).Methods("GET")
@@ -278,6 +310,15 @@ func main() {
 	channelRouter.HandleFunc("/{id}", handleUpdateChannel).Methods("PUT")
 	channelRouter.HandleFunc("/{id}/metadata", handleSetChannelMetadata).Methods("POST")
 	channelRouter.HandleFunc("/{id}/permissions", handleSetChannelPermissions).Methods("POST")
+
+	// Web Push: VAPID public key is non-secret (clients embed it, obbyircd
+	// advertises it in ISUPPORT), so the key endpoint is unauthenticated.
+	r.HandleFunc("/push/vapid-key", handleVapidKey).Methods("GET", "OPTIONS")
+	// The send endpoint is obbyircd-only -- guarded by the shared
+	// X-ObsidianIRC-Key (same secret the /irc/* server routes use).
+	pushRouter := r.PathPrefix("/push").Subrouter()
+	pushRouter.Use(ServerAuthMiddleware)
+	pushRouter.HandleFunc("/send", handlePushSend).Methods("POST")
 
 	// pprof on loopback only -- useful for diagnosing runaway memory
 	// without exposing it externally.  curl 127.0.0.1:6060/debug/pprof/heap
