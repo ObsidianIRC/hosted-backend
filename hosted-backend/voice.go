@@ -3,7 +3,7 @@
 //
 // Architecture:
 //
-//   ObsidianIRC client               obbyircd                  hosted-backend (this file)
+//   obbyworld client               obbyircd                  hosted-backend (this file)
 //   ─────────────────                ────────                  ──────────────
 //   TAGMSG ^vc @+obsidianirc/rtc=…   →                         (received via bridge)
 //                                    ↓ voice.c module
