@@ -3,7 +3,7 @@
 //
 // Architecture:
 //
-//   ObsidianIRC client               obbyircd                  hosted-backend (this file)
+//   obbyworld client               obbyircd                  hosted-backend (this file)
 //   ─────────────────                ────────                  ──────────────
 //   TAGMSG ^vc @+obsidianirc/rtc=…   →                         (received via bridge)
 //                                    ↓ voice.c module
@@ -35,8 +35,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pion/turn/v3"
 	"github.com/pion/rtcp"
+	"github.com/pion/turn/v3"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -63,6 +63,15 @@ type VoiceConfig struct {
 	MaxRoomSize int
 	// ICE/TURN realm for the embedded TURN server.
 	Realm string
+	// When true, skip starting the embedded TURN listener.  The SFU
+	// still runs; clients are expected to receive TURN credentials
+	// from an external source (e.g. the IRCd's voice::turn rewrite).
+	DisableEmbeddedTurn bool
+	// Ephemeral UDP port range pion gathers ICE candidates on.  Must
+	// be published in the container's port spec for clients to reach
+	// the SFU directly.
+	WebRTCPortMin uint16
+	WebRTCPortMax uint16
 }
 
 func loadVoiceConfig() VoiceConfig {
@@ -90,6 +99,19 @@ func loadVoiceConfig() VoiceConfig {
 			cfg.MaxRoomSize = p
 		}
 	}
+	if b, err := strconv.ParseBool(strings.TrimSpace(os.Getenv("VOICE_TURN_DISABLE_EMBEDDED"))); err == nil {
+		cfg.DisableEmbeddedTurn = b
+	}
+	if v := os.Getenv("VOICE_WEBRTC_PORT_MIN"); v != "" {
+		if p, err := strconv.Atoi(v); err == nil && p > 0 && p < 65536 {
+			cfg.WebRTCPortMin = uint16(p)
+		}
+	}
+	if v := os.Getenv("VOICE_WEBRTC_PORT_MAX"); v != "" {
+		if p, err := strconv.Atoi(v); err == nil && p > 0 && p < 65536 {
+			cfg.WebRTCPortMax = uint16(p)
+		}
+	}
 	return cfg
 }
 
@@ -106,10 +128,10 @@ func loadVoiceConfig() VoiceConfig {
 // The TURN server uses the same secret to validate the password,
 // rejecting anything past the expiry.
 type TurnCreds struct {
-	Username string `json:"username"`
-	Password string `json:"password"`
+	Username string   `json:"username"`
+	Password string   `json:"password"`
 	URLs     []string `json:"urls"`
-	TTL      int64  `json:"ttl"`
+	TTL      int64    `json:"ttl"`
 }
 
 func mintTurnCreds(cfg VoiceConfig, account string, ttl time.Duration) TurnCreds {
@@ -246,8 +268,8 @@ type signalEnvelope struct {
 	SDP string `json:"sdp,omitempty"`
 
 	// "ice"
-	Candidate     string `json:"cand,omitempty"`
-	SDPMid        string `json:"mid,omitempty"`
+	Candidate     string  `json:"cand,omitempty"`
+	SDPMid        string  `json:"mid,omitempty"`
 	SDPMLineIndex *uint16 `json:"mlineidx,omitempty"`
 
 	// state broadcast: "mic" / "video" / "speaking" / "silent" /
@@ -378,6 +400,7 @@ type voicePeer struct {
 
 type voiceManager struct {
 	cfg   VoiceConfig
+	api   *webrtc.API
 	mu    sync.RWMutex
 	rooms map[string]*voiceRoom
 	// Outgoing message channel back to the IRCd bridge.  All
@@ -394,27 +417,45 @@ type voiceManager struct {
 func newVoiceManager(cfg VoiceConfig) *voiceManager {
 	return &voiceManager{
 		cfg:   cfg,
+		api:   newWebrtcAPI(cfg),
 		rooms: map[string]*voiceRoom{},
 	}
 }
 
-// peerConnectionConfig builds the ICE config that gets sent to clients
-// (they run their own PCs and need our TURN URL/creds).
+// Server-side PeerConnection only needs STUN; TURN relay is for the
+// *client* side and is delivered via the "joined" envelope's `turn`
+// field (mintTurnCreds).  Including TURN here without credentials
+// causes pion to reject NewPeerConnection.
 func (m *voiceManager) peerConnectionConfig() webrtc.Configuration {
-	host := m.cfg.PublicIP
-	if host == "" {
-		host = "127.0.0.1"
-	}
-	// Server-side PeerConnection only needs STUN; TURN relay is for
-	// the *client* side and is delivered via the "joined" envelope's
-	// `turn` field (mintTurnCreds).  Including TURN here without
-	// credentials causes pion to reject NewPeerConnection.
-	_ = host
 	return webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
 			{URLs: []string{"stun:stun.l.google.com:19302"}},
 		},
 	}
+}
+
+// newWebrtcAPI constructs a *webrtc.API with NAT1To1 + ephemeral-port
+// settings so server-side PeerConnections advertise reachable host
+// candidates when running behind container NAT.  Without these, the
+// SFU only emits container-internal IPs and Google-STUN-derived srflx
+// candidates pointing at unmapped ephemeral ports, and ICE never
+// converges from outside the host.
+func newWebrtcAPI(cfg VoiceConfig) *webrtc.API {
+	se := webrtc.SettingEngine{}
+	if cfg.PublicIP != "" {
+		se.SetNAT1To1IPs([]string{cfg.PublicIP}, webrtc.ICECandidateTypeHost)
+	}
+	if cfg.WebRTCPortMin > 0 && cfg.WebRTCPortMax >= cfg.WebRTCPortMin {
+		if err := se.SetEphemeralUDPPortRange(cfg.WebRTCPortMin, cfg.WebRTCPortMax); err != nil {
+			log.Printf("voice: SetEphemeralUDPPortRange(%d,%d): %v",
+				cfg.WebRTCPortMin, cfg.WebRTCPortMax, err)
+		}
+	}
+	m := &webrtc.MediaEngine{}
+	if err := m.RegisterDefaultCodecs(); err != nil {
+		log.Printf("voice: RegisterDefaultCodecs: %v", err)
+	}
+	return webrtc.NewAPI(webrtc.WithSettingEngine(se), webrtc.WithMediaEngine(m))
 }
 
 func (m *voiceManager) getOrCreateRoom(name string) *voiceRoom {
@@ -488,7 +529,7 @@ func (m *voiceManager) handleJoin(nick, channel, account string) {
 		// Idempotent: re-issue a fresh PC if a stale one still exists.
 		room.peers[nick].close()
 	}
-	pc, err := webrtc.NewPeerConnection(m.peerConnectionConfig())
+	pc, err := m.api.NewPeerConnection(m.peerConnectionConfig())
 	if err != nil {
 		room.mu.Unlock()
 		m.send(nick, signalEnvelope{
