@@ -7,7 +7,7 @@
 # Compose: docker compose up -d
 
 FROM golang:1.25-alpine AS builder
-RUN apk add --no-cache build-base sqlite-dev
+RUN apk add --no-cache build-base sqlite-dev opus-dev opusfile-dev pkgconfig
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -15,7 +15,7 @@ COPY . .
 RUN CGO_ENABLED=1 go build -trimpath -ldflags="-s -w" -o /out/backend .
 
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates sqlite-libs tzdata netcat-openbsd \
+RUN apk add --no-cache ca-certificates sqlite-libs tzdata netcat-openbsd opus opusfile \
     && adduser -D -u 1000 backend \
     && mkdir -p /app/data /app/images /run/obbyirc \
     && chown -R backend:backend /app /run/obbyirc
