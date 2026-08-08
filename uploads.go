@@ -17,6 +17,7 @@
 package main
 
 import (
+	"bytes"
 	cryptorand "crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -37,7 +38,14 @@ var defaultAllowedExtensions = []string{
 	".mp4", ".webm", ".mov", ".m4v", ".ogv",
 	// audio
 	".mp3", ".ogg", ".oga", ".opus", ".wav", ".flac", ".aac", ".m4a",
+	// encrypted attachments
+	e2eeExtension,
 }
+
+// Rewriting these bytes breaks the client's authentication tag.
+const e2eeExtension = ".obb"
+
+var e2eeMagic = []byte("OBBYE2EE\x01")
 
 // Magic-byte / structural sniff overrides for types where Go's
 // http.DetectContentType is wrong or too permissive.  Each entry is a
@@ -175,6 +183,12 @@ func detectAndValidate(data []byte, ext string) error {
 	}
 	if len(data) < 8 {
 		return errors.New("file is too short to validate")
+	}
+	if ext == e2eeExtension {
+		if !bytes.HasPrefix(data, e2eeMagic) {
+			return fmt.Errorf("file content does not match the %s extension", ext)
+		}
+		return nil
 	}
 	detected := http.DetectContentType(data)
 	expected, ok := magicBytePrefixes[ext]
